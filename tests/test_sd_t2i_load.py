@@ -85,10 +85,24 @@ def test_turbo_recipe_from_filename(tmp_path: Path) -> None:
     )
 
 
+class _FakeModule:
+    def __init__(self) -> None:
+        self.memory_format = None
+
+    def to(self, *args, **kwargs):
+        self.memory_format = kwargs.get("memory_format")
+        return self
+
+
 class _FakePipe:
     def __init__(self) -> None:
         self.moved_to = None
         self.sliced = False
+        self.xformers = False
+        self.safety_checker = object()
+        self.requires_safety_checker = True
+        self.unet = _FakeModule()
+        self.vae = _FakeModule()
 
     def to(self, device):
         self.moved_to = device
@@ -96,6 +110,9 @@ class _FakePipe:
 
     def enable_attention_slicing(self) -> None:
         self.sliced = True
+
+    def enable_xformers_memory_efficient_attention(self) -> None:
+        self.xformers = True
 
     def set_progress_bar_config(self, **kwargs) -> None:
         return None
@@ -236,9 +253,26 @@ def test_kernel_load_dispatches_snapshot_dir(monkeypatch, tmp_path: Path) -> Non
             self.type = str(name).split(":")[0]
             self.name = str(name)
 
+    class FakeMatmul:
+        allow_tf32 = False
+
+    class FakeCuda:
+        matmul = FakeMatmul()
+
+    class FakeCudnn:
+        benchmark = False
+        allow_tf32 = False
+
+    class FakeBackends:
+        cuda = FakeCuda()
+        cudnn = FakeCudnn()
+
     fake_torch.device = FakeDevice
     fake_torch.float16 = "float16"
     fake_torch.float32 = "float32"
+    fake_torch.channels_last = "channels_last"
+    fake_torch.backends = FakeBackends()
+    fake_torch.set_float32_matmul_precision = lambda *_args, **_kwargs: None
     fake_diffusers = types.ModuleType("diffusers")
     fake_diffusers.AutoPipelineForText2Image = FakeAuto
     fake_diffusers.StableDiffusionPipeline = FakeSingle
@@ -252,7 +286,13 @@ def test_kernel_load_dispatches_snapshot_dir(monkeypatch, tmp_path: Path) -> Non
     kernel.load(device)
     assert captured["auto"]["path"] == str(model_dir)
     assert captured["auto"]["local_files_only"] is True
+    assert captured["auto"].get("variant") == "fp16"
     assert fake.sliced is False
+    assert fake.safety_checker is None
+    assert fake.xformers is True
+    assert fake.unet.memory_format == "channels_last"
+    assert fake_torch.backends.cuda.matmul.allow_tf32 is True
+    assert fake_torch.backends.cudnn.benchmark is True
 
 
 def test_adopt_local_single_file(tmp_path: Path, monkeypatch) -> None:

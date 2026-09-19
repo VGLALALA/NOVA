@@ -308,3 +308,18 @@ relative to the initial commit.
 - Ignored `starter/.tools/` (bun cache) and `.claude/worktrees/` so they
   cannot enter the first real commit.
 - Source, tests, dashboard, pear sidecar, scripts, and docs remain tracked.
+
+### 2026-09-19 — Linux NVIDIA kernel path (pre-pod image)
+
+- CUDA/ROCm load now: prefer `variant=fp16` snapshot, disable safety checker,
+  enable TF32 + cuDNN benchmark, channels-last on unet/vae, optional
+  xformers, `torch.inference_mode()`, and `cuda.synchronize()` before timing.
+- Metal still uses attention slicing; CUDA does not.
+- `scripts/download_model.py` skips the 5GB original checkpoint and fp32
+  twins so Linux boxes download the fp16 snapshot only.
+- Setup docs: if the box already has CUDA torch (RunPod/NGC), install only
+  `.[gpu]` extras and do not replace the wheel.
+- Tests: CUDA snapshot load asserts fp16 variant, no slicing, xformers,
+  channels-last, TF32. Full suite **109 passed**, 1.91s.
+- RunPod target (not yet image-verified): RTX 4000 Ada 20GB, driver 595.91,
+  CUDA 13.2 / nvcc 12.4, torch 2.4.1+cu124, Python 3.11.10, Ubuntu 22.04.

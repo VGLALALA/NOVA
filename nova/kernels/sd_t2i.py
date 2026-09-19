@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,53 @@ def uses_turbo_recipe(settings: Settings, pretrained: str) -> bool:
     return "turbo" in haystack
 
 
+def _disable_safety_checker(pipe: Any) -> None:
+    if hasattr(pipe, "safety_checker"):
+        pipe.safety_checker = None
+    if hasattr(pipe, "requires_safety_checker"):
+        pipe.requires_safety_checker = False
+
+
+def _tune_nvidia(torch: Any, pipe: Any) -> None:
+    """CUDA/ROCm runtime knobs. Safe no-ops if a backend attribute is missing."""
+    backends = getattr(torch, "backends", None)
+    cuda_b = getattr(backends, "cuda", None) if backends is not None else None
+    matmul = getattr(cuda_b, "matmul", None)
+    if matmul is not None:
+        try:
+            matmul.allow_tf32 = True
+        except Exception:
+            pass
+    cudnn = getattr(backends, "cudnn", None) if backends is not None else None
+    if cudnn is not None:
+        try:
+            cudnn.benchmark = True
+            cudnn.allow_tf32 = True
+        except Exception:
+            pass
+    setter = getattr(torch, "set_float32_matmul_precision", None)
+    if callable(setter):
+        try:
+            setter("high")
+        except Exception:
+            pass
+    channels_last = getattr(torch, "channels_last", None)
+    if channels_last is not None:
+        for name in ("unet", "vae"):
+            module = getattr(pipe, name, None)
+            if module is not None and hasattr(module, "to"):
+                try:
+                    module.to(memory_format=channels_last)
+                except Exception:
+                    pass
+    enable_x = getattr(pipe, "enable_xformers_memory_efficient_attention", None)
+    if callable(enable_x):
+        try:
+            enable_x()
+        except Exception:
+            pass
+
+
 class SDText2ImageKernel(NovaKernel):
     kernel_id = KERNEL_SD_T2I
 
@@ -133,24 +181,34 @@ class SDText2ImageKernel(NovaKernel):
         config_dir = Path(self.settings.model_dir)
         local_config = str(config_dir) if (config_dir / "model_index.json").is_file() else None
 
+        common: dict[str, Any] = {
+            "torch_dtype": dtype,
+            "local_files_only": True,
+        }
         try:
             if is_single_file_checkpoint(pretrained):
-                kwargs: dict[str, Any] = {
-                    "torch_dtype": dtype,
-                    "local_files_only": True,
-                    "use_safetensors": True,
-                    "safety_checker": None,
-                    "requires_safety_checker": False,
-                }
+                kwargs = dict(common)
+                kwargs.update(
+                    {
+                        "use_safetensors": True,
+                        "safety_checker": None,
+                        "requires_safety_checker": False,
+                    }
+                )
                 if local_config is not None:
                     kwargs["config"] = local_config
                 pipe = StableDiffusionPipeline.from_single_file(pretrained, **kwargs)
             else:
-                pipe = AutoPipelineForText2Image.from_pretrained(
-                    pretrained,
-                    torch_dtype=dtype,
-                    local_files_only=True,
-                )
+                pipe = None
+                if dtype != torch.float32:
+                    try:
+                        pipe = AutoPipelineForText2Image.from_pretrained(
+                            pretrained, variant="fp16", **common
+                        )
+                    except Exception:
+                        pipe = None
+                if pipe is None:
+                    pipe = AutoPipelineForText2Image.from_pretrained(pretrained, **common)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load {pretrained} with local_files_only=True. "
@@ -159,9 +217,12 @@ class SDText2ImageKernel(NovaKernel):
             ) from exc
 
         pipe = pipe.to(torch_dev)
+        _disable_safety_checker(pipe)
         if device.backend == "metal":
             if hasattr(pipe, "enable_attention_slicing"):
                 pipe.enable_attention_slicing()
+        elif device.backend in {"cuda", "rocm"}:
+            _tune_nvidia(torch, pipe)
         if hasattr(pipe, "set_progress_bar_config"):
             pipe.set_progress_bar_config(disable=True)
         self._pipe = pipe
@@ -182,14 +243,22 @@ class SDText2ImageKernel(NovaKernel):
         else:
             generator = torch.Generator(device=self._torch_device).manual_seed(int(task.seed))
 
-        out = self._pipe(
-            prompt=task.prompt,
-            num_inference_steps=int(task.steps or 4),
-            guidance_scale=guidance,
-            width=int(task.width or 512),
-            height=int(task.height or 512),
-            generator=generator,
-        )
+        infer = getattr(torch, "inference_mode", None)
+        ctx = infer() if callable(infer) else nullcontext()
+        with ctx:
+            out = self._pipe(
+                prompt=task.prompt,
+                num_inference_steps=int(task.steps or 4),
+                guidance_scale=guidance,
+                width=int(task.width or 512),
+                height=int(task.height or 512),
+                generator=generator,
+            )
+        if self._torch_device is not None and getattr(self._torch_device, "type", None) == "cuda":
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
         image = out.images[0]
         buf = io.BytesIO()
         image.save(buf, format="PNG")

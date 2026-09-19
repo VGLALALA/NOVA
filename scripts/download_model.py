@@ -17,6 +17,17 @@ SINGLE_FILE_CANDIDATES = (
     Path.home() / "Downloads" / "sd-turbo.safetensors",
 )
 _MIN_SINGLE_FILE_BYTES = 1_000_000_000
+# Skip the 5GB original checkpoint and fp32 twins; the kernel prefers variant=fp16.
+IGNORE_PATTERNS = (
+    "sd_turbo.safetensors",
+    "*.png",
+    "*.jpg",
+    "LICENSE.md",
+    "README.md",
+    ".gitattributes",
+    "**/diffusion_pytorch_model.safetensors",
+    "text_encoder/model.safetensors",
+)
 
 
 def _ensure_hub():
@@ -110,8 +121,8 @@ def main() -> int:
     _ensure_hub()
     from huggingface_hub import snapshot_download
 
-    print(f"Downloading {REPO} → {dest}")
-    snapshot_download(repo_id=REPO, local_dir=str(dest))
+    print(f"Downloading {REPO} → {dest} (fp16 snapshot, no 5GB original)")
+    snapshot_download(repo_id=REPO, local_dir=str(dest), ignore_patterns=list(IGNORE_PATTERNS))
     print()
     print("Done. Weights are on disk.")
     print()

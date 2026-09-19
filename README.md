@@ -52,7 +52,7 @@ python scripts/download_model.py
 | Windows NVIDIA | CUDA wheel from pytorch.org | `backend=cuda`, `device_id=cuda:0` |
 | Linux NVIDIA | CUDA wheel from pytorch.org | `backend=cuda`, `device_id=cuda:0` |
 
-Do not `pip install torch` from the default index on NVIDIA boxes — that often yields a CPU wheel. Use the CUDA index for that platform, then confirm:
+Do not `pip install torch` from the default index on NVIDIA boxes — that often yields a CPU wheel. If the machine already has `torch` with `cuda=True` (RunPod, NGC, conda CUDA), install only `.[gpu]` extras and leave torch alone. Confirm:
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available(), getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available())"
