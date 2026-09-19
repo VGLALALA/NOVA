@@ -323,3 +323,7 @@ relative to the initial commit.
   channels-last, TF32. Full suite **109 passed**, 1.91s.
 - RunPod target (not yet image-verified): RTX 4000 Ada 20GB, driver 595.91,
   CUDA 13.2 / nvcc 12.4, torch 2.4.1+cu124, Python 3.11.10, Ubuntu 22.04.
+- First pod install pulled transformers 5.17 / diffusers 0.40, which refuse
+  torch 2.4 (`PyTorch >= 2.5 required` + FlashAttn-3 custom-op schema error).
+  GPU extras are now pinned `diffusers>=0.31,<0.35` and `transformers>=4.45,<5`.
+  Kernel falls back to `StableDiffusionPipeline` if AutoPipeline import fails.

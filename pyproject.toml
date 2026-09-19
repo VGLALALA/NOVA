@@ -24,9 +24,12 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = [
-    "diffusers>=0.31.0",
-    "transformers>=4.45.0",
-    "accelerate>=1.1.0",
+    # Pin below transformers 5 / diffusers 0.35 so Linux CUDA boxes on
+    # torch 2.4 (RunPod/NGC) still import. transformers 5 requires torch>=2.5;
+    # diffusers 0.40 registers FlashAttn-3 custom ops that 2.4 cannot schema.
+    "diffusers>=0.31.0,<0.35",
+    "transformers>=4.45.0,<5",
+    "accelerate>=1.1.0,<2",
     "safetensors>=0.4.5",
 ]
 dev = [

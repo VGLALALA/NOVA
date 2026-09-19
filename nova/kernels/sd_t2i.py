@@ -168,9 +168,13 @@ class SDText2ImageKernel(NovaKernel):
             return
         try:
             import torch
-            from diffusers import AutoPipelineForText2Image, StableDiffusionPipeline
+            from diffusers import StableDiffusionPipeline
         except ImportError as exc:
             raise RuntimeError(_MISSING) from exc
+        try:
+            from diffusers import AutoPipelineForText2Image
+        except Exception:
+            AutoPipelineForText2Image = None  # type: ignore[misc, assignment]
 
         torch_dev = torch.device(to_torch_device(device))
         dtype = torch.float32 if device.backend == "cpu" else torch.float16
@@ -199,16 +203,15 @@ class SDText2ImageKernel(NovaKernel):
                     kwargs["config"] = local_config
                 pipe = StableDiffusionPipeline.from_single_file(pretrained, **kwargs)
             else:
+                loader = AutoPipelineForText2Image or StableDiffusionPipeline
                 pipe = None
                 if dtype != torch.float32:
                     try:
-                        pipe = AutoPipelineForText2Image.from_pretrained(
-                            pretrained, variant="fp16", **common
-                        )
+                        pipe = loader.from_pretrained(pretrained, variant="fp16", **common)
                     except Exception:
                         pipe = None
                 if pipe is None:
-                    pipe = AutoPipelineForText2Image.from_pretrained(pretrained, **common)
+                    pipe = loader.from_pretrained(pretrained, **common)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load {pretrained} with local_files_only=True. "
