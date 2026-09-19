@@ -1,0 +1,630 @@
+"""NOVA CLI. `nova start` prints the LAN dashboard URL and binds HTTP."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import inspect
+import socket
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+import typer
+
+from nova.clock import Clock
+from nova.config import Settings, load_settings
+from nova.events import EventBus
+from nova.identity import load_or_create
+from nova.models import Device, NodeIdentity, NodeManifest
+
+app = typer.Typer(
+    name="nova",
+    add_completion=False,
+    no_args_is_help=True,
+    help="NOVA — three runtimes, one compute pool.",
+)
+
+
+def detect_lan_ip() -> str:
+    """Best-effort LAN address for the dashboard URL. Never guess a public IP."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.4)
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def _optional(module: str, name: str) -> Any | None:
+    try:
+        mod = importlib.import_module(module)
+    except ImportError:
+        return None
+    return getattr(mod, name, None)
+
+
+def _construct(cls: Any, **kwargs: Any) -> Any:
+    sig = inspect.signature(cls.__init__)
+    allowed = {
+        key: value
+        for key, value in kwargs.items()
+        if key in sig.parameters and key != "self"
+    }
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return cls(**kwargs)
+    return cls(**allowed)
+
+
+def _echo(msg: str, *, err: bool = False) -> None:
+    typer.echo(msg, err=err)
+
+
+class FallbackStore:
+    """In-process store so the dashboard can run before coordinator modules land."""
+
+    def __init__(self, data_dir: Path) -> None:
+        self.jobs: dict[str, Any] = {}
+        self.tasks: dict[str, Any] = {}
+        self.nodes: dict[str, Any] = {}
+        self.tiles_dir = Path(data_dir) / "tiles"
+        self.tiles_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_job(self, job_id: str) -> Any | None:
+        return self.jobs.get(job_id)
+
+    def list_jobs(self) -> list[Any]:
+        return list(self.jobs.values())
+
+    def list_tasks(self, job_id: str) -> list[Any]:
+        return [t for t in self.tasks.values() if t.job_id == job_id]
+
+    def get_task(self, task_id: str) -> Any | None:
+        return self.tasks.get(task_id)
+
+    def list_nodes(self) -> list[Any]:
+        return list(self.nodes.values())
+
+    def upsert_node(self, node: NodeManifest) -> None:
+        self.nodes[node.node_id] = node
+
+    def put_node(self, node: NodeManifest) -> None:
+        self.nodes[node.node_id] = node
+
+    def submit_job(self, job: Any, tasks: list[Any]) -> Any:
+        stale = [tid for tid, t in self.tasks.items() if t.job_id == job.job_id]
+        for tid in stale:
+            del self.tasks[tid]
+        job.state = "RUNNING"
+        self.jobs[job.job_id] = job
+        for t in tasks:
+            self.tasks[t.task_id] = t
+        return job
+
+    def cancel_job(self, job_id: str) -> None:
+        job = self.jobs.get(job_id)
+        if job is not None:
+            job.state = "CANCELLED"
+        for t in self.list_tasks(job_id):
+            if t.state not in ("COMPLETED", "FAILED"):
+                t.state = "CANCELLED"
+
+    def save_result(self, task: Any, png_bytes: bytes, sha256: str) -> Path:
+        from nova.clock import now_utc
+
+        dest_dir = self.tiles_dir / task.job_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = dest_dir / f"{task.task_id}.png"
+        path.write_bytes(png_bytes)
+        task.result_sha256 = sha256
+        task.result_path = str(path)
+        task.state = "COMPLETED"
+        task.completed_at = now_utc()
+        self.tasks[task.task_id] = task
+        return path
+
+
+class FallbackScheduler:
+    def __init__(self, store: Any, bus: EventBus) -> None:
+        self.store = store
+        self.bus = bus
+
+    def submit_job(self, job: Any, tasks: list[Any]) -> Any:
+        return self.store.submit_job(job, tasks)
+
+    def cancel_job(self, job_id: str) -> None:
+        self.store.cancel_job(job_id)
+
+    def accept_result(
+        self,
+        job_id: str,
+        task_id: str,
+        png_bytes: bytes,
+        lease_gen: int,
+        sha256: str,
+        node_id: str | None = None,
+    ) -> dict[str, str]:
+        tasks = self.store.list_tasks(job_id)
+        if tasks and all(t.state == "COMPLETED" for t in tasks):
+            job = self.store.get_job(job_id)
+            if job is not None:
+                job.state = "COMPLETED"
+                self.bus.emit("JOB_COMPLETED", job_id=job_id, total=len(tasks))
+        return {"status": "accepted"}
+
+    def on_complete(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def _inject_sim_nodes(store: Any, count: int) -> None:
+    backends = ("cuda", "rocm", "metal")
+    vendors = ("nvidia", "amd", "apple")
+    models = ("RTX 4090", "RX 7900 XTX", "M3 Max")
+    mem = (24576, 24576, 16384)
+    for i in range(count):
+        idx = i % 3
+        backend = backends[idx]
+        node = NodeManifest(
+            node_id=f"sim-{i + 1:02d}",
+            hostname=f"sim-{i + 1:02d}",
+            devices=[
+                Device(
+                    device_id=f"{backend}:0",
+                    backend=backend,
+                    vendor=vendors[idx],
+                    model=models[idx],
+                    memory_total_mb=mem[idx],
+                    memory_free_mb=mem[idx] // 2,
+                )
+            ],
+            benchmark_scores={"sd.t2i.v1": round(12.0 - idx * 3.5 - i * 0.1, 2)},
+            status="online",
+        )
+        upsert = getattr(store, "upsert_node", None) or getattr(store, "put_node", None)
+        if callable(upsert):
+            upsert(node)
+        elif isinstance(getattr(store, "nodes", None), dict):
+            store.nodes[node.node_id] = node
+
+
+def _build_store(settings: Settings, bus: EventBus, clock: Any | None = None) -> tuple[Any, Any, bool]:
+    store_cls = _optional("nova.store", "Store")
+    sched_cls = _optional("nova.scheduler", "Scheduler")
+    stub = False
+    store: Any
+    scheduler: Any
+    if store_cls is not None:
+        store = _construct(
+            store_cls,
+            data_dir=settings.data_dir,
+            tiles_dir=settings.data_dir / "tiles",
+            settings=settings,
+        )
+    else:
+        _echo("[nova] nova.store.Store not ready — in-process fallback store")
+        store = FallbackStore(settings.data_dir)
+        stub = True
+    if sched_cls is not None:
+        scheduler = _construct(
+            sched_cls,
+            store=store,
+            bus=bus,
+            event_bus=bus,
+            settings=settings,
+            clock=clock,
+        )
+    else:
+        _echo("[nova] nova.scheduler.Scheduler not ready — in-process fallback scheduler")
+        scheduler = FallbackScheduler(store, bus)
+        stub = True
+    return store, scheduler, stub
+
+
+def _worker_connect_addrs(settings: Settings) -> list[tuple[str, int]]:
+    addrs = settings.peer_list()
+    if addrs:
+        return addrs
+    url = settings.coordinator_url
+    if not url:
+        return []
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = parsed.hostname
+    if not host:
+        return []
+    return [(host, settings.control_port)]
+
+
+def _make_tcp(
+    *,
+    node_id: str,
+    listen: bool,
+    connect_addrs: list[tuple[str, int]],
+    settings: Settings,
+) -> Any | None:
+    tcp_cls = _optional("nova.network.tcp", "TcpTransport")
+    if tcp_cls is None:
+        return None
+    return tcp_cls(
+        listen_host=settings.control_host if listen else None,
+        listen_port=settings.control_port if listen else None,
+        connect_addrs=list(connect_addrs),
+        node_id=node_id,
+    )
+
+
+def _make_worker(
+    *,
+    settings: Settings,
+    transport: Any,
+    identity: NodeIdentity,
+    clock: Any | None = None,
+) -> Any:
+    worker_cls = _optional("nova.worker", "Worker")
+    if worker_cls is None:
+        raise RuntimeError("nova.worker.Worker is not available yet")
+    return worker_cls(settings, transport, identity=identity, clock=clock)
+
+
+def worker_mode(cli_worker: bool, settings: Settings) -> bool:
+    """`--worker` wins; otherwise honor NOVA_ROLE=worker."""
+    if cli_worker:
+        return True
+    return str(getattr(settings, "role", "") or "").strip().lower() == "worker"
+
+
+async def _wait_started(server: Any, timeout_s: float = 8.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while not getattr(server, "started", False):
+        if getattr(server, "should_exit", False) or loop.time() >= deadline:
+            return
+        await asyncio.sleep(0.05)
+
+
+def _coordinator_url(settings: Settings) -> str:
+    return (settings.coordinator_url or settings.public_http_url()).rstrip("/")
+
+
+def _http_get(settings: Settings, path: str) -> Any:
+    url = f"{_coordinator_url(settings)}{path}"
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            res = client.get(url)
+            res.raise_for_status()
+            return res.json()
+    except httpx.ConnectError as exc:
+        _echo(f"Coordinator not reachable at {url} — start it with `nova start`", err=True)
+        raise typer.Exit(1) from exc
+    except httpx.HTTPError as exc:
+        _echo(f"HTTP error from {url}: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
+def start(
+    worker: bool = typer.Option(False, "--worker", help="Worker only; do not bind HTTP."),
+    dummy: bool = typer.Option(False, "--dummy", help="Dummy kernel, no torch."),
+    simulate_workers: int = typer.Option(
+        0,
+        "--simulate-workers",
+        help="Inject N fake workers (rehearsal). Parsed even if workers land later.",
+    ),
+) -> None:
+    """Coordinator HTTP + TCP control. Also runs a local worker unless --worker / NOVA_ROLE=worker."""
+    settings = load_settings(
+        dummy=True if dummy else None,
+        role="worker" if worker else None,
+    )
+    as_worker = worker_mode(worker, settings)
+    if not settings.advertise_host:
+        settings = settings.model_copy(update={"advertise_host": detect_lan_ip()})
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    ident = load_or_create(settings.data_dir)
+    bus = EventBus()
+    clock = Clock()
+
+    _echo(f"[nova] node_id     {ident.node_id}")
+    _echo(f"[nova] role        {'worker' if as_worker else 'coordinator'}")
+    if dummy or settings.dummy:
+        _echo("[nova] kernel      dummy (no torch)")
+
+    if as_worker:
+        url = settings.coordinator_url or settings.public_http_url()
+        _echo(f"[nova] coordinator {url}")
+        addrs = _worker_connect_addrs(settings)
+        if not addrs:
+            _echo(
+                "Worker needs NOVA_COORDINATOR_URL or NOVA_PEERS=host:7946 "
+                "to reach the coordinator.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        if _optional("nova.worker", "Worker") is None:
+            _echo("Cannot start worker: nova.worker.Worker is not available yet.", err=True)
+            raise typer.Exit(1)
+        transport = _make_tcp(
+            node_id=ident.node_id,
+            listen=False,
+            connect_addrs=addrs,
+            settings=settings,
+        )
+        if transport is None:
+            _echo("Cannot start worker: nova.network.tcp.TcpTransport is not available yet.", err=True)
+            raise typer.Exit(1)
+
+        async def _run_worker() -> None:
+            inst = _make_worker(settings=settings, transport=transport, identity=ident, clock=clock)
+            try:
+                await inst.run()
+            finally:
+                stop = getattr(inst, "stop", None)
+                if callable(stop):
+                    try:
+                        await stop()
+                    except Exception:
+                        pass
+
+        try:
+            asyncio.run(_run_worker())
+        except KeyboardInterrupt:
+            _echo("\n[nova] worker stopped")
+        except Exception as exc:
+            _echo(f"Cannot start worker: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        return
+
+    from nova.api import create_app
+
+    store, scheduler, stub = _build_store(settings, bus, clock=clock)
+    fa_app = create_app(store, scheduler, bus, settings, settings.data_dir)
+    public = settings.public_http_url()
+    typer.secho(f"[nova] dashboard  {public}", fg="green", bold=True)
+    _echo(f"[nova] health     {public}/health")
+    _echo(f"[nova] control    {settings.advertise_host}:{settings.control_port}")
+    if stub:
+        _echo("[nova] coordinator modules incomplete — HTTP/dashboard still up")
+
+    async def _run_coordinator() -> None:
+        import uvicorn
+
+        coordinator = None
+        local_worker = None
+        cluster = None
+        coord_cls = _optional("nova.coordinator", "Coordinator")
+        sim_broker_cls = _optional("nova.simulate", "InProcessBroker")
+        sim_run = _optional("nova.simulate", "run_simulated_workers")
+        use_sim = bool(simulate_workers) and sim_broker_cls is not None and callable(sim_run)
+
+        if use_sim:
+            _echo(f"[nova] --simulate-workers {simulate_workers}")
+            broker = sim_broker_cls()
+            transport = broker.attach(ident.node_id, coordinator=True)
+            if coord_cls is not None:
+                coordinator = coord_cls(store, scheduler, transport, bus, settings, clock, ident)
+                await coordinator.start()
+                fa_app.state.coordinator = coordinator
+                _echo("[nova] in-process control plane up")
+            else:
+                _echo("[nova] nova.coordinator.Coordinator not ready — HTTP only")
+                _inject_sim_nodes(store, simulate_workers)
+        else:
+            if simulate_workers:
+                _echo(f"[nova] --simulate-workers {simulate_workers} (display cards only)")
+                _inject_sim_nodes(store, simulate_workers)
+                bus.emit("SYSTEM", message=f"simulated {simulate_workers} workers")
+            transport = _make_tcp(
+                node_id=ident.node_id,
+                listen=True,
+                connect_addrs=[],
+                settings=settings,
+            )
+            if transport is None:
+                _echo("[nova] nova.network.tcp.TcpTransport not ready — HTTP only")
+            elif coord_cls is not None:
+                coordinator = coord_cls(store, scheduler, transport, bus, settings, clock, ident)
+                await coordinator.start()
+                fa_app.state.coordinator = coordinator
+                bound = getattr(transport, "bound_port", None) or settings.control_port
+                _echo(f"[nova] TCP control plane up :{bound}")
+            else:
+                try:
+                    await transport.start()
+                    _echo("[nova] TCP control plane up")
+                except Exception as exc:
+                    _echo(f"[nova] TCP control plane failed: {exc}", err=True)
+
+        config = uvicorn.Config(
+            fa_app,
+            host=settings.http_host,
+            port=settings.http_port,
+            log_level="info",
+        )
+        server = uvicorn.Server(config)
+        serve_task = asyncio.create_task(server.serve(), name="nova-http")
+        try:
+            await _wait_started(server)
+            if use_sim:
+                cluster = await sim_run(
+                    coordinator if coordinator is not None else broker,
+                    simulate_workers,
+                    coordinator_id=ident.node_id,
+                )
+                _echo(f"[nova] simulated {simulate_workers} workers attached")
+            elif not simulate_workers and _optional("nova.worker", "Worker") is not None:
+                control_port = getattr(transport, "bound_port", None) or settings.control_port
+                worker_ident = load_or_create(settings.data_dir / "local-worker")
+                worker_transport = _make_tcp(
+                    node_id=worker_ident.node_id,
+                    listen=False,
+                    connect_addrs=[("127.0.0.1", int(control_port))],
+                    settings=settings,
+                )
+                if worker_transport is None:
+                    _echo("[nova] local worker skipped — TcpTransport missing")
+                else:
+                    try:
+                        local_worker = _make_worker(
+                            settings=settings,
+                            transport=worker_transport,
+                            identity=worker_ident,
+                            clock=clock,
+                        )
+                        asyncio.create_task(local_worker.run(), name="nova-local-worker")
+                        _echo(f"[nova] local worker {worker_ident.node_id}")
+                    except Exception as exc:
+                        _echo(f"[nova] local worker failed to start: {exc}", err=True)
+                        local_worker = None
+            elif _optional("nova.worker", "Worker") is None:
+                _echo("[nova] nova.worker.Worker not ready — dashboard/API only")
+            await serve_task
+        finally:
+            server.should_exit = True
+            if local_worker is not None:
+                stop = getattr(local_worker, "stop", None)
+                if callable(stop):
+                    try:
+                        await asyncio.wait_for(stop(), timeout=1.5)
+                    except Exception:
+                        pass
+            if cluster is not None:
+                stop_all = getattr(cluster, "stop_all", None)
+                if callable(stop_all):
+                    try:
+                        await asyncio.wait_for(stop_all(graceful=True), timeout=1.5)
+                    except Exception:
+                        pass
+            if coordinator is not None:
+                stop = getattr(coordinator, "stop", None)
+                if callable(stop):
+                    try:
+                        await asyncio.wait_for(stop(), timeout=1.5)
+                    except Exception:
+                        pass
+            if not serve_task.done():
+                serve_task.cancel()
+                try:
+                    await serve_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    try:
+        asyncio.run(_run_coordinator())
+    except KeyboardInterrupt:
+        _echo("\n[nova] coordinator stopped")
+
+
+@app.command()
+def nodes() -> None:
+    """List nodes known to the coordinator."""
+    settings = load_settings()
+    if not settings.advertise_host:
+        settings = settings.model_copy(update={"advertise_host": detect_lan_ip()})
+    payload = _http_get(settings, "/nodes")
+    if not payload:
+        _echo("No nodes (is anything running `nova start`?)")
+        return
+    for node in payload:
+        nid = node.get("node_id", "?")
+        status = node.get("display_status") or node.get("status") or "?"
+        model = node.get("primary_model") or "-"
+        backend = node.get("primary_backend") or "-"
+        score = node.get("score")
+        score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "-"
+        _echo(f"{nid:16}  {status:8}  {model:16}  {backend:6}  score={score_s}")
+
+
+@app.command()
+def jobs() -> None:
+    """List jobs on the coordinator."""
+    settings = load_settings()
+    if not settings.advertise_host:
+        settings = settings.model_copy(update={"advertise_host": detect_lan_ip()})
+    payload = _http_get(settings, "/jobs")
+    if not payload:
+        _echo("No jobs.")
+        return
+    for job in payload:
+        jid = job.get("job_id") or job.get("name")
+        state = job.get("state")
+        done = job.get("completed", 0)
+        total = job.get("total", 0)
+        _echo(f"{jid:20}  {state:10}  {done}/{total}")
+
+
+@app.command("run")
+def run_job(
+    yaml_path: Path = typer.Argument(..., exists=True, readable=True, help="Gallery yaml"),
+) -> None:
+    """Submit a gallery job (demo/gallery.yaml)."""
+    settings = load_settings()
+    if not settings.advertise_host:
+        settings = settings.model_copy(update={"advertise_host": detect_lan_ip()})
+    url = f"{_coordinator_url(settings)}/jobs"
+    body = {"path": str(yaml_path.resolve())}
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            res = client.post(url, json=body)
+            if res.status_code >= 400:
+                _echo(f"Submit failed ({res.status_code}): {res.text}", err=True)
+                raise typer.Exit(1)
+            job = res.json()
+    except httpx.ConnectError as exc:
+        _echo(f"Coordinator not reachable at {url} — start it with `nova start`", err=True)
+        raise typer.Exit(1) from exc
+    jid = job.get("job_id")
+    total = job.get("total")
+    _echo(f"submitted {jid}  ({total} tiles)")
+    _echo(f"dashboard {_coordinator_url(settings)}")
+
+
+@app.command()
+def benchmark(
+    dummy: bool = typer.Option(False, "--dummy", help="Skip torch; print a dummy score."),
+) -> None:
+    """Warmup one image and print the sd.t2i.v1 score."""
+    settings = load_settings(dummy=True if dummy else None)
+    if dummy or settings.dummy:
+        _echo("dummy kernel  latency_ms=50  score=20.00")
+        return
+    load_kernel = _optional("nova.kernels", "load_kernel") or _optional("nova.kernels.base", "load_kernel")
+    probe = _optional("nova.hardware", "probe_devices")
+    preferred = _optional("nova.hardware", "preferred_device")
+    if callable(load_kernel) and callable(probe):
+        try:
+            kernel = load_kernel(settings.kernel, settings)
+            devices = probe()
+            device = preferred(devices) if callable(preferred) else None
+            device = device or (devices[0] if devices else None)
+            if device is None:
+                raise RuntimeError("no devices found")
+            result = kernel.warmup(device)
+            latency = max(int(getattr(result, "execution_ms", 0) or 0), 1)
+            score = 1000.0 / latency
+            backend = getattr(device, "backend", "?")
+            _echo(f"{backend}  latency_ms={latency}  score={score:.2f}")
+            return
+        except Exception as exc:
+            _echo(f"Benchmark failed: {exc}", err=True)
+            raise typer.Exit(1) from exc
+    _echo(
+        "Cannot benchmark: nova.kernels / nova.hardware not available yet. "
+        "Use `nova benchmark --dummy` for a no-torch rehearsal.",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+if __name__ == "__main__":
+    app()

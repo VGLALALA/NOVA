@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NOVA NETWORK</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <h1>NOVA NETWORK</h1>
+        <p class="tagline">Three runtimes. One compute pool.</p>
+      </div>
+      <div class="meta">
+        <div id="node-line" class="node-line">waiting for nodes</div>
+        <div id="badges" class="badges"></div>
+      </div>
+      <div id="link-state" class="link poll">POLL</div>
+    </header>
+
+    <main class="main">
+      <section class="panel nodes-panel">
+        <h2>Nodes</h2>
+        <div id="node-cards" class="node-cards">
+          <p class="empty-hint">No workers yet.</p>
+        </div>
+      </section>
+
+      <section class="panel gallery-panel">
+        <div class="job-head">
+          <h2 id="job-title">JOB —</h2>
+          <div id="job-progress" class="job-progress">0/24</div>
+        </div>
+        <div id="tiles" class="tiles" aria-label="gallery tiles"></div>
+        <div id="contrib" class="contrib"></div>
+      </section>
+
+      <section class="panel feed-panel">
+        <h2>Event feed</h2>
+        <ol id="feed" class="feed"></ol>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

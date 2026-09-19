@@ -1,0 +1,64 @@
+job:
+  name: nova-gallery
+  type: sd_gallery
+  kernel: sd.t2i.v1
+
+model:
+  id: stabilityai/sd-turbo
+  steps: 4
+  width: 512
+  height: 512
+
+requirements:
+  min_memory_mb: 4096
+  allowed_backends: [cuda, rocm, metal]
+
+prompts:
+  - text: "neon street at night, cinematic, 35mm"
+    seed: 1000
+  - text: "ancient library, volumetric light, dust motes"
+    seed: 1001
+  - text: "misty pine forest at dawn, analog film grain"
+    seed: 1002
+  - text: "orbital station above a blue planet, wide shot"
+    seed: 1003
+  - text: "desert canyon, golden hour, long shadows"
+    seed: 1004
+  - text: "rain-soaked tokyo alley, reflections, umbrellas"
+    seed: 1005
+  - text: "underwater coral city, bioluminescence"
+    seed: 1006
+  - text: "mountain observatory, star trails, snow"
+    seed: 1007
+  - text: "brutalist concrete atrium, shaft of sunlight"
+    seed: 1008
+  - text: "steam locomotive in fog, industrial era"
+    seed: 1009
+  - text: "greenhouse overgrown with ferns, glass roof"
+    seed: 1010
+  - text: "arctic research hut, aurora over ice"
+    seed: 1011
+  - text: "rooftop garden in a dense megacity, dusk"
+    seed: 1012
+  - text: "subterranean magma forge, orange glow"
+    seed: 1013
+  - text: "quiet harbor at blue hour, fishing boats"
+    seed: 1014
+  - text: "crystal cave, lantern light, still water"
+    seed: 1015
+  - text: "wind farm on a green ridge, dramatic clouds"
+    seed: 1016
+  - text: "old bookshop interior, warm lamps, oak shelves"
+    seed: 1017
+  - text: "cliffside monastery, sea spray, morning"
+    seed: 1018
+  - text: "night market food stalls, steam, lanterns"
+    seed: 1019
+  - text: "abandoned spaceport hangar, shafts of light"
+    seed: 1020
+  - text: "lavender field, storm approaching, wide lens"
+    seed: 1021
+  - text: "clockwork planetarium, brass gears, candles"
+    seed: 1022
+  - text: "frozen waterfall, pale sun, 4x5 landscape"
+    seed: 1023
