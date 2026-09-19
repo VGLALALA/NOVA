@@ -58,8 +58,8 @@ failover unverified.**
 
 ### Worker and kernels
 
-Status: **Implemented; dummy path unit verified; Mac Metal image-generation
-demo-verified locally; Windows/Linux CUDA still unverified.**
+Status: **Implemented; dummy path unit verified; Mac Metal and Linux CUDA
+image-generation demo-verified; Windows CUDA still unverified.**
 
 - Hardware probing, backend-specific device selection, dummy kernel, SD-Turbo
   kernel, local-files-only model loading, warmup, independent heartbeat/progress
@@ -70,7 +70,9 @@ demo-verified locally; Windows/Linux CUDA still unverified.**
   `models/sd-turbo/` or a lone `sd_turbo.safetensors`. Incomplete snapshots
   fall back to `from_single_file` and pass local `model_index.json` as
   `config` so conversion does not hit gated SD 2.1 repos.
-- Mac Metal 512×512 image recorded 2026-09-19. CUDA / ROCm still unverified.
+- Mac Metal 512×512 image recorded 2026-09-19. Linux CUDA 512×512 image
+  recorded 2026-09-19 on RunPod RTX 4000 Ada. Windows CUDA / ROCm still
+  unverified.
 
 ### Control plane and discovery
 
@@ -116,16 +118,15 @@ full rehearsal unverified.**
 6. ~~Make `NOVA_ROLE=worker` select worker startup as documented~~ **done
    locally** (2026-09-19); `--worker` still wins over env.
 7. ~~Fail closed for real GPU startup when torch/diffusers or a CUDA/ROCm/Metal
-   accelerator is missing~~ **done in unit tests** (2026-09-19). Mac Metal
-   warmup is now **Demo verified locally**. Windows CUDA / Linux CUDA remain
-   **Demo unverified**.
+   accelerator is missing~~ **done in unit tests** (2026-09-19). Mac Metal and
+   Linux CUDA warmup are **Demo verified**. Windows CUDA remains unverified.
 8. Exercise two real processes over TCP and measure Ctrl+C disconnect-to-requeue
    latency; prove it is under two seconds without waiting for heartbeat timeout.
 9. Exercise Pear/Hyperswarm discovery on the intended hotspot and separately
    rehearse the typed `NOVA_COORDINATOR_URL` / `NOVA_PEERS` fallback.
-10. ~~Download weights and generate one local 512×512 image on Mac Metal~~
-    **done locally** (2026-09-19). Still need the same proof on Windows CUDA
-    and Linux CUDA. ROCm is opportunistic, not a judging blocker.
+10. ~~Download weights and generate one local 512×512 image on Mac Metal and
+    Linux CUDA~~ **done** (2026-09-19). Still need the same proof on Windows
+    CUDA. ROCm is opportunistic, not a judging blocker.
 11. Run a mixed-worker 24-tile gallery, kill one worker near 40%, verify the job
     still finishes, and repeat the failover rehearsal ten times.
 12. Record the backup dashboard session and full two-minute take.
@@ -327,3 +328,23 @@ relative to the initial commit.
   torch 2.4 (`PyTorch >= 2.5 required` + FlashAttn-3 custom-op schema error).
   GPU extras are now pinned `diffusers>=0.31,<0.35` and `transformers>=4.45,<5`.
   Kernel falls back to `StableDiffusionPipeline` if AutoPipeline import fails.
+
+### 2026-09-19 — Linux CUDA image on RunPod RTX 4000 Ada
+
+- Pod: `0jdlqbjdts2vnh`, Ubuntu 22.04, Python 3.11.10, driver 595.91,
+  CUDA toolkit 12.4, torch **2.4.1+cu124** left in place.
+- Repo at `/workspace/NOVA` (`f0b9699`). GPU extras after pin:
+  diffusers **0.34.0**, transformers **4.57.6**. Import of
+  `StableDiffusionPipeline` / `AutoPipelineForText2Image` succeeded.
+- Probe: `backend=cuda`, `device_id=cuda:0`, NVIDIA RTX 4000 Ada
+  Generation, 20019 MB.
+- `python3 scripts/cuda_smoke.py`:
+  - warmup (1 step, includes load): **1616 ms** execution, 13.63s wall,
+    471260 PNG bytes, 512×512 RGB,
+    sha256 `94e87e2584b09fb1e2826cb789990c8aa04f14b3bc81ad21b77c5418cbec01dc`
+  - 4-step tile after load: **312 ms**, 524621 PNG bytes, 512×512 RGB,
+    sha256 `86fc39c4d357759c41a2758f74b52c6454ff6126ae0cb6efe94d7204d7f8d2cc`
+- `nova benchmark`: `cuda  latency_ms=1624  score=0.62` (cold-ish load;
+  the 312 ms 4-step number is the live-tile figure).
+- Files on pod: `/tmp/nova-cuda-warmup.png`, `/tmp/nova-cuda-tile.png`.
+  RunPod SSH wrapper has no scp subsystem; hashes/sizes verified over TTY.
