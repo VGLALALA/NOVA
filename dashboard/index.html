@@ -19,6 +19,19 @@
       <div id="link-state" class="link poll">POLL</div>
     </header>
 
+    <section class="dispatch" aria-label="job dispatch">
+      <div class="dispatch-row">
+        <button id="send-gallery" type="button" class="btn primary">Send 24-tile job</button>
+        <button id="send-custom" type="button" class="btn">Send custom</button>
+        <button id="cancel-job" type="button" class="btn danger">Cancel</button>
+        <label class="seed-label">seed
+          <input id="seed" type="number" value="1000" min="0" step="1" />
+        </label>
+        <span id="dispatch-status" class="dispatch-status">waiting for workers</span>
+      </div>
+      <textarea id="custom-prompt" class="prompt" rows="2" placeholder="optional custom prompt — leave empty to dispatch the 24-tile gallery"></textarea>
+    </section>
+
     <main class="main">
       <section class="panel nodes-panel">
         <h2>Nodes</h2>

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nova"
-version = "0.1.0"
+version = "0.2.0"
 description = "NOVA — Networked On-demand Virtual Acceleration. Heterogeneous P2P GPU batch runtime."
 readme = "README.md"
 license = { text = "MIT" }

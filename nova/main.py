@@ -284,6 +284,17 @@ def worker_mode(cli_worker: bool, settings: Settings) -> bool:
     return str(getattr(settings, "role", "") or "").strip().lower() == "worker"
 
 
+def dashboard_only_mode(cli_dashboard: bool, cli_no_local_worker: bool, settings: Settings) -> bool:
+    """Dashboard service: HTTP + scheduler, no in-process worker.
+
+    `nova start` still runs a local worker. Only `--dashboard`,
+    `--no-local-worker`, or `NOVA_ROLE=dashboard` skip it.
+    """
+    if cli_dashboard or cli_no_local_worker:
+        return True
+    return str(getattr(settings, "role", "") or "").strip().lower() == "dashboard"
+
+
 async def _wait_started(server: Any, timeout_s: float = 8.0) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
@@ -315,19 +326,32 @@ def _http_get(settings: Settings, path: str) -> Any:
 @app.command()
 def start(
     worker: bool = typer.Option(False, "--worker", help="Worker only; do not bind HTTP."),
+    dashboard: bool = typer.Option(
+        False,
+        "--dashboard",
+        help="Job dashboard service: HTTP + scheduler, no local worker.",
+    ),
     dummy: bool = typer.Option(False, "--dummy", help="Dummy kernel, no torch."),
     simulate_workers: int = typer.Option(
         0,
         "--simulate-workers",
         help="Inject N fake workers (rehearsal). Parsed even if workers land later.",
     ),
+    no_local_worker: bool = typer.Option(
+        False,
+        "--no-local-worker",
+        help="Do not start the in-process worker next to the dashboard.",
+    ),
 ) -> None:
-    """Coordinator HTTP + TCP control. Also runs a local worker unless --worker / NOVA_ROLE=worker."""
+    """Coordinator HTTP + TCP control. Also runs a local worker unless --worker / --dashboard."""
     settings = load_settings(
         dummy=True if dummy else None,
-        role="worker" if worker else None,
+        role="worker" if worker else ("dashboard" if dashboard else None),
     )
     as_worker = worker_mode(worker, settings)
+    dashboard_only = (not as_worker) and dashboard_only_mode(dashboard, no_local_worker, settings)
+    if dashboard:
+        dashboard_only = True
     if not settings.advertise_host:
         settings = settings.model_copy(update={"advertise_host": detect_lan_ip()})
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -336,7 +360,13 @@ def start(
     clock = Clock()
 
     _echo(f"[nova] node_id     {ident.node_id}")
-    _echo(f"[nova] role        {'worker' if as_worker else 'coordinator'}")
+    if as_worker:
+        role_label = "worker"
+    elif dashboard_only:
+        role_label = "dashboard"
+    else:
+        role_label = "coordinator"
+    _echo(f"[nova] role        {role_label}")
     if dummy or settings.dummy:
         _echo("[nova] kernel      dummy (no torch)")
 
@@ -462,7 +492,11 @@ def start(
                     coordinator_id=ident.node_id,
                 )
                 _echo(f"[nova] simulated {simulate_workers} workers attached")
-            elif not simulate_workers and _optional("nova.worker", "Worker") is not None:
+            elif (
+                not dashboard_only
+                and not simulate_workers
+                and _optional("nova.worker", "Worker") is not None
+            ):
                 control_port = getattr(transport, "bound_port", None) or settings.control_port
                 worker_ident = load_or_create(settings.data_dir / "local-worker")
                 worker_transport = _make_tcp(
@@ -486,6 +520,8 @@ def start(
                     except Exception as exc:
                         _echo(f"[nova] local worker failed to start: {exc}", err=True)
                         local_worker = None
+            elif dashboard_only:
+                _echo("[nova] dashboard service — workers join with `nova worker`")
             elif _optional("nova.worker", "Worker") is None:
                 _echo("[nova] nova.worker.Worker not ready — dashboard/API only")
             await serve_task
@@ -523,6 +559,39 @@ def start(
         asyncio.run(_run_coordinator())
     except KeyboardInterrupt:
         _echo("\n[nova] coordinator stopped")
+
+
+@app.command()
+def dashboard(
+    dummy: bool = typer.Option(False, "--dummy", help="Dummy kernel, no torch."),
+    simulate_workers: int = typer.Option(
+        0,
+        "--simulate-workers",
+        help="Inject N fake workers (rehearsal).",
+    ),
+) -> None:
+    """Job dashboard service: HTTP API + live gallery. Workers join separately."""
+    start(
+        worker=False,
+        dashboard=True,
+        dummy=dummy,
+        simulate_workers=simulate_workers,
+        no_local_worker=True,
+    )
+
+
+@app.command()
+def worker(
+    dummy: bool = typer.Option(False, "--dummy", help="Dummy kernel, no torch."),
+) -> None:
+    """Worker service: pull tiles from the dashboard and PUT PNG results."""
+    start(
+        worker=True,
+        dashboard=False,
+        dummy=dummy,
+        simulate_workers=0,
+        no_local_worker=False,
+    )
 
 
 @app.command()

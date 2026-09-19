@@ -111,6 +111,87 @@ body {
   border-color: var(--suspect);
 }
 
+.dispatch {
+  padding: 14px 28px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.dispatch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.btn.primary {
+  border-color: var(--cuda);
+  color: var(--cuda);
+}
+
+.btn.danger {
+  border-color: var(--lost);
+  color: var(--lost);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: wait;
+}
+
+.seed-label {
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.seed-label input {
+  width: 92px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  font: inherit;
+  padding: 8px 10px;
+}
+
+.dispatch-status {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.prompt {
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  font: inherit;
+  font-size: 16px;
+  padding: 10px 12px;
+  resize: vertical;
+  min-height: 52px;
+}
+
 .main {
   flex: 1;
   display: grid;

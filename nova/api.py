@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -28,8 +29,15 @@ from nova.models import (
 )
 
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
+DEMO_GALLERY = Path(__file__).resolve().parent.parent / "demo" / "gallery.yaml"
 BACKEND_ORDER = ("cuda", "rocm", "metal", "cpu")
 LIVE_STATES = ("LEASED", "RUNNING")
+
+
+def _new_job_id(name: str) -> str:
+    slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in (name or "nova-gallery"))
+    slug = slug.strip("-") or "nova-gallery"
+    return f"{slug}-{uuid.uuid4().hex[:8]}"
 
 
 def _assert_png(data: bytes) -> None:
@@ -69,7 +77,8 @@ def split_gallery_doc(doc: dict[str, Any], *, job_id: str | None = None) -> tupl
     req_raw = doc.get("requirements") or {}
     prompts_raw = doc.get("prompts") or []
     name = str(spec.get("name") or "nova-gallery")
-    jid = job_id or name
+    explicit = job_id if job_id else spec.get("id")
+    jid = str(explicit) if explicit else _new_job_id(name)
     req = JobRequirements(
         min_memory_mb=int(req_raw.get("min_memory_mb", 4096)),
         allowed_backends=list(req_raw.get("allowed_backends") or ["cuda", "rocm", "metal"]),
@@ -149,14 +158,22 @@ def _get_job(store: Any, job_id: str) -> Any | None:
     return None
 
 
+def _job_created_key(job: Any) -> str:
+    return str(_as_dict(job).get("created_at") or "")
+
+
 def _list_jobs(store: Any) -> list[Any]:
     fn = getattr(store, "list_jobs", None)
     if callable(fn):
-        return list(fn())
-    jobs = getattr(store, "jobs", None)
-    if isinstance(jobs, dict):
-        return list(jobs.values())
-    return []
+        jobs = list(fn())
+    else:
+        raw = getattr(store, "jobs", None)
+        if isinstance(raw, dict):
+            jobs = list(raw.values())
+        else:
+            jobs = []
+    jobs.sort(key=_job_created_key, reverse=True)
+    return jobs
 
 
 def _list_tasks(store: Any, job_id: str) -> list[Any]:
@@ -458,6 +475,8 @@ def _invoke_accept_result(
 
 
 def _parse_job_body(body: dict[str, Any], *, cwd: Path) -> tuple[Job, list[Task]]:
+    requested_id = body.get("job_id")
+    requested_id = str(requested_id) if requested_id else None
     path_raw = body.get("path") or body.get("yaml_path")
     yaml_text = body.get("yaml")
     if path_raw:
@@ -467,21 +486,27 @@ def _parse_job_body(body: dict[str, Any], *, cwd: Path) -> tuple[Job, list[Task]
         if not path.is_file():
             raise HTTPException(status_code=400, detail=f"yaml not found: {path}")
         try:
-            return split_gallery_path(path)
+            job, tasks = split_gallery_path(path)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"invalid gallery yaml: {exc}") from exc
+        if requested_id and job.job_id != requested_id:
+            return split_gallery_doc(
+                yaml.safe_load(path.read_text(encoding="utf-8")),
+                job_id=requested_id,
+            )
+        return job, tasks
     if isinstance(yaml_text, str):
         doc = yaml.safe_load(yaml_text)
         if not isinstance(doc, dict):
             raise HTTPException(status_code=400, detail="yaml must be a mapping")
-        return split_gallery_doc(doc)
+        return split_gallery_doc(doc, job_id=requested_id)
     if "prompts" in body:
-        return split_gallery_doc(body)
+        return split_gallery_doc(body, job_id=requested_id)
     nested = body.get("job")
     if isinstance(nested, dict) and ("prompts" in nested or "name" in nested):
         # inline {job, model, requirements, prompts} sometimes nests prompts at top
         if "prompts" in body or "model" in body:
-            return split_gallery_doc(body)
+            return split_gallery_doc(body, job_id=requested_id)
     raise HTTPException(
         status_code=400,
         detail="provide {path}, {yaml}, or a gallery document with prompts",
@@ -544,6 +569,9 @@ def create_app(
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="JSON object required")
         job, tasks = _parse_job_body(body, cwd=Path.cwd())
+        return JSONResponse(await _dispatch_job(job, tasks), status_code=201)
+
+    async def _dispatch_job(job: Job, tasks: list[Task]) -> dict[str, Any]:
         coordinator = getattr(app.state, "coordinator", None)
         submitted = False
         if coordinator is not None:
@@ -565,7 +593,32 @@ def create_app(
             if callable(put_job):
                 put_job(current)
         bus.emit("JOB_STARTED", job_id=job.job_id, name=job.name, total=len(tasks))
-        return JSONResponse(_job_payload(store, current), status_code=201)
+        return _job_payload(store, current)
+
+    @app.get("/gallery/default")
+    def default_gallery() -> dict[str, Any]:
+        if not DEMO_GALLERY.is_file():
+            raise HTTPException(status_code=404, detail="demo/gallery.yaml not found")
+        doc = yaml.safe_load(DEMO_GALLERY.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            raise HTTPException(status_code=500, detail="invalid demo gallery")
+        prompts = doc.get("prompts") or []
+        return {
+            "path": str(DEMO_GALLERY),
+            "name": (doc.get("job") or {}).get("name") or "nova-gallery",
+            "kernel": (doc.get("job") or {}).get("kernel") or KERNEL_SD_T2I,
+            "model": doc.get("model") or {},
+            "requirements": doc.get("requirements") or {},
+            "prompts": prompts,
+            "total": len(prompts),
+        }
+
+    @app.post("/jobs/gallery")
+    async def post_default_gallery() -> JSONResponse:
+        if not DEMO_GALLERY.is_file():
+            raise HTTPException(status_code=404, detail="demo/gallery.yaml not found")
+        job, tasks = split_gallery_path(DEMO_GALLERY)
+        return JSONResponse(await _dispatch_job(job, tasks), status_code=201)
 
     @app.get("/jobs/{job_id}")
     def get_job(job_id: str) -> dict[str, Any]:

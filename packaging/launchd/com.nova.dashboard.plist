@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.nova.dashboard</string>
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>REPO_ROOT/.venv/bin/nova</string>
+      <string>dashboard</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>NOVA_ROLE</key>
+      <string>dashboard</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>REPO_ROOT/.nova/dashboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPO_ROOT/.nova/dashboard.err</string>
+  </dict>
+</plist>

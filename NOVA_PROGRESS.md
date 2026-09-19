@@ -1,6 +1,6 @@
 # NOVA Development Progress
 
-Last updated: 2026-09-19
+Last updated: 2026-09-19 (v0.2.0 services + dashboard dispatch)
 
 This is the living handoff ledger for NOVA. Read this file together with
 `NOVA_DEVELOPMENT_PLAN.md`, which remains the implementation contract. Update
@@ -92,9 +92,10 @@ unverified.**
 Status: **Implemented; local automated/smoke verification present; projector and
 full rehearsal unverified.**
 
-- FastAPI endpoints, WebSocket event stream, static dashboard, CLI commands,
-  deterministic 24-prompt gallery YAML, dummy kernel, and three-worker in-process
-  simulation are present.
+- FastAPI endpoints, WebSocket event stream, static dashboard with **Send 24-tile
+  job**, CLI commands (`nova dashboard` / `nova worker`), systemd/launchd/Windows
+  service units, deterministic 24-prompt gallery YAML, dummy kernel, and
+  three-worker in-process simulation are present.
 - API result validation covers empty bodies, garbage PNGs, SHA-256, stale lease
   generations, and first-winner behavior.
 - A full browser rehearsal, projector readability check, contribution labels,
@@ -348,3 +349,18 @@ relative to the initial commit.
   the 312 ms 4-step number is the live-tile figure).
 - Files on pod: `/tmp/nova-cuda-warmup.png`, `/tmp/nova-cuda-tile.png`.
   RunPod SSH wrapper has no scp subsystem; hashes/sizes verified over TTY.
+
+### 2026-09-19 — worker service + job dashboard service (v0.2.0)
+
+- Split long-running processes: `nova dashboard` (HTTP API + live gallery, no
+  in-process GPU worker) and `nova worker` (pull client + kernel). `nova start`
+  still runs dashboard + local worker for the one-machine demo.
+- Dashboard UI now dispatches work: **Send 24-tile job**, custom prompt, cancel.
+  `POST /jobs/gallery` and `GET /gallery/default` wrap `demo/gallery.yaml`.
+  Gallery jobs mint unique `nova-gallery-<hex>` ids so repeat clicks do not
+  collide.
+- Packaging: systemd user units, launchd agents, Windows scheduled-task
+  installer under `packaging/` + `scripts/install-service.sh|.ps1`.
+- Version bumped to 0.2.0 for the GitHub Release.
+- Remaining: physical service install on Windows CUDA still unverified;
+  GitHub Release cut after this commit.

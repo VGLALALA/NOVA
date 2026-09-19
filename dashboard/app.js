@@ -19,6 +19,12 @@ const els = {
   tiles: document.getElementById("tiles"),
   contrib: document.getElementById("contrib"),
   feed: document.getElementById("feed"),
+  sendGallery: document.getElementById("send-gallery"),
+  sendCustom: document.getElementById("send-custom"),
+  cancelJob: document.getElementById("cancel-job"),
+  seed: document.getElementById("seed"),
+  prompt: document.getElementById("custom-prompt"),
+  dispatchStatus: document.getElementById("dispatch-status"),
 };
 
 let pollOnly = true;
@@ -37,6 +43,38 @@ async function getJSON(path) {
   const res = await fetch(path, { cache: "no-store" });
   if (!res.ok) throw new Error(`${path} ${res.status}`);
   return res.json();
+}
+
+async function postJSON(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (_err) {
+      data = { detail: text };
+    }
+  }
+  if (!res.ok) {
+    const detail = data.detail || data.message || text || res.status;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return data;
+}
+
+function setDispatch(text) {
+  if (els.dispatchStatus) els.dispatchStatus.textContent = text;
+}
+
+function setBusy(busy) {
+  [els.sendGallery, els.sendCustom, els.cancelJob].forEach((btn) => {
+    if (btn) btn.disabled = busy;
+  });
 }
 
 function setLink(mode) {
@@ -285,6 +323,10 @@ async function refresh() {
     const jobs = asList(jobsRaw);
     renderHeader(system, nodes);
     renderNodes(nodes);
+    const online = nodes.filter((n) => (n.status || "") === "online").length;
+    if (!lastJobId && els.dispatchStatus && !els.dispatchStatus.dataset.locked) {
+      setDispatch(online ? `${online} worker${online === 1 ? "" : "s"} ready` : "waiting for workers");
+    }
     const job = jobs[0] || null;
     if (!job) {
       els.jobTitle.textContent = "JOB —";
@@ -352,6 +394,69 @@ function connectEvents() {
     try { ws.close(); } catch (_err) { /* ignore */ }
   };
 }
+
+async function sendGallery() {
+  setBusy(true);
+  setDispatch("sending gallery…");
+  try {
+    const job = await postJSON("/jobs/gallery", {});
+    lastJobId = job.job_id;
+    setDispatch(`sent ${job.job_id}  (${job.total || 24} tiles)`);
+    await refresh();
+  } catch (err) {
+    setDispatch(`send failed: ${err.message || err}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function sendCustom() {
+  const text = (els.prompt && els.prompt.value || "").trim();
+  if (!text) {
+    setDispatch("enter a prompt, or use Send 24-tile job");
+    return;
+  }
+  const seed = Number((els.seed && els.seed.value) || 1000);
+  setBusy(true);
+  setDispatch("sending custom job…");
+  try {
+    const job = await postJSON("/jobs", {
+      job: { name: "nova-custom", type: "sd_gallery", kernel: "sd.t2i.v1" },
+      model: { id: "stabilityai/sd-turbo", steps: 4, width: 512, height: 512 },
+      requirements: { min_memory_mb: 4096, allowed_backends: ["cuda", "rocm", "metal"] },
+      prompts: [{ text, seed: Number.isFinite(seed) ? seed : 1000 }],
+    });
+    lastJobId = job.job_id;
+    setDispatch(`sent ${job.job_id}  (${job.total || 1} tile)`);
+    await refresh();
+  } catch (err) {
+    setDispatch(`send failed: ${err.message || err}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function cancelCurrent() {
+  if (!lastJobId) {
+    setDispatch("no job to cancel");
+    return;
+  }
+  setBusy(true);
+  setDispatch(`cancelling ${lastJobId}…`);
+  try {
+    await postJSON(`/jobs/${encodeURIComponent(lastJobId)}/cancel`, {});
+    setDispatch(`cancelled ${lastJobId}`);
+    await refresh();
+  } catch (err) {
+    setDispatch(`cancel failed: ${err.message || err}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+if (els.sendGallery) els.sendGallery.addEventListener("click", sendGallery);
+if (els.sendCustom) els.sendCustom.addEventListener("click", sendCustom);
+if (els.cancelJob) els.cancelJob.addEventListener("click", cancelCurrent);
 
 ensureTiles();
 setLink("poll");

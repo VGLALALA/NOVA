@@ -1,0 +1,18 @@
+[Unit]
+Description=NOVA GPU worker (pull tiles, PUT PNG results)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/NOVA
+EnvironmentFile=-%h/NOVA/.env
+Environment=NOVA_ROLE=worker
+ExecStart=%h/NOVA/.venv/bin/nova worker
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=4
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

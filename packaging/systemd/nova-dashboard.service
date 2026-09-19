@@ -1,0 +1,18 @@
+[Unit]
+Description=NOVA job dashboard (coordinator HTTP + scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/NOVA
+EnvironmentFile=-%h/NOVA/.env
+Environment=NOVA_ROLE=dashboard
+ExecStart=%h/NOVA/.venv/bin/nova dashboard
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=4
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

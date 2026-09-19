@@ -6,7 +6,7 @@ Coordinator-led P2P rendering runtime for Hack the North 2026. One workload: 24 
 
 ## What judges see
 
-Three machines. Dashboard badges for the backends that are actually present. `nova run demo/gallery.yaml`. Empty 4×6 grid. Tiles appear, tagged by vendor. Ctrl+C one worker → event feed shows OFFLINE, unfinished tiles requeue, the others finish the job.
+Three machines. Dashboard badges for the backends that are actually present. Open the job dashboard, click **Send 24-tile job**. Empty 4×6 grid. Tiles appear, tagged by vendor. Ctrl+C one worker → event feed shows OFFLINE, unfinished tiles requeue, the others finish the job.
 
 ## One-machine dummy rehearsal
 
@@ -63,23 +63,48 @@ At demo time the worker loads **local files only**. Do not hit Hugging Face whil
 A Hugging Face snapshot under `models/sd-turbo/` (with `model_index.json`) is preferred. A lone `sd_turbo.safetensors` in that directory, or `NOVA_MODEL_DIR` pointing at the file, also works — the kernel uses `from_single_file` for that path.
 
 ```bash
-# submitter / projector
-nova start
+# submitter / projector — job dashboard service (HTTP + scheduler, no local GPU)
+nova dashboard
 
-# other machines (flag or env)
-NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova start --worker
+# GPU machines — worker service
+NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova worker
 # equivalent:
-# NOVA_ROLE=worker NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova start
+# NOVA_ROLE=worker NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova start --worker
 ```
 
-Then `nova run demo/gallery.yaml` from the submitter.
+On the dashboard, click **Send 24-tile job**. `nova run demo/gallery.yaml` still works from a terminal.
+
+`nova start` remains the one-process demo (dashboard + local worker). `nova dashboard` / `nova worker` are the two long-running services.
+
+## Services
+
+Install as a user service after `./scripts/setup.sh` (and `pip install -e ".[gpu]"` on workers):
+
+```bash
+# projector / submitter
+./scripts/install-service.sh dashboard
+
+# each GPU box (set NOVA_COORDINATOR_URL in .env first)
+./scripts/install-service.sh worker
+```
+
+| OS | What gets installed |
+|---|---|
+| Linux | systemd user units `nova-dashboard` / `nova-worker` |
+| macOS | launchd agents `com.nova.dashboard` / `com.nova.worker` |
+| Windows | `.\scripts\install-service.ps1 dashboard\|worker` scheduled tasks |
+
+Units live under `packaging/`. LAN-only HTTP, no auth — do not port-forward `:8080`.
 
 ## CLI
 
 | Command | What it does |
 |---|---|
+| `nova dashboard` | Job dashboard service: HTTP API + live gallery, no local worker |
+| `nova worker` | Worker service: pull tiles, PUT PNG results |
 | `nova start` | Coordinator HTTP + TCP control, plus a local worker |
-| `nova start --worker` | Worker only (also `NOVA_ROLE=worker`) |
+| `nova start --dashboard` | Same as `nova dashboard` |
+| `nova start --worker` | Same as `nova worker` (also `NOVA_ROLE=worker`) |
 | `nova start --dummy` | Dummy kernel, no torch |
 | `nova start --simulate-workers N` | N in-process CUDA/ROCm/Metal dummy workers |
 | `nova nodes` | GET `/nodes` |
@@ -87,7 +112,7 @@ Then `nova run demo/gallery.yaml` from the submitter.
 | `nova run demo/gallery.yaml` | POST `/jobs` |
 | `nova benchmark` | Warmup score (`--dummy` prints a stub) |
 
-`nova join` is not a command. `nova start` joins the swarm.
+`nova join` is not a command. Workers join with `nova worker`.
 
 ## HTTP (LAN-only, no auth)
 
@@ -100,6 +125,8 @@ Bind is 0.0.0.0:8080 by default. Do not port-forward this to the internet.
 | GET | `/nodes` |
 | GET | `/jobs` |
 | POST | `/jobs` |
+| POST | `/jobs/gallery` (dispatch `demo/gallery.yaml`) |
+| GET | `/gallery/default` |
 | GET | `/jobs/{job_id}` |
 | POST | `/jobs/{job_id}/cancel` |
 | GET | `/jobs/{job_id}/tasks` |
