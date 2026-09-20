@@ -190,28 +190,18 @@ class Coordinator:
         self.bus.emit("PEER_CONNECTED", peer_id=peer_id)
 
     def _parse_tcp_target(self, raw: str, port: int | None = None) -> tuple[str, int]:
+        from nova.config import parse_peer
+
         text = (raw or "").strip()
         if not text:
             raise ValueError("host required")
-        if port is not None:
-            if text.count(":") == 1 and "/" not in text:
-                host, _, maybe = text.partition(":")
-                if maybe.isdigit():
-                    return host.strip(), int(maybe)
-            return text.split(":")[0].strip(), int(port)
-        if "://" in text:
-            from urllib.parse import urlparse
-
-            parsed = urlparse(text if "://" in text else f"tcp://{text}")
-            host = parsed.hostname or text
-            p = parsed.port
-            if p is None:
-                raise ValueError("port required")
-            return host, int(p)
-        if text.count(":") == 1:
-            host, _, p = text.partition(":")
-            return host.strip(), int(p)
-        raise ValueError("expected host:port")
+        host, parsed_port = parse_peer(text, default_port=int(port or 7946))
+        if not host:
+            raise ValueError("host required")
+        bare = text.strip("[]")
+        if port is not None and "://" not in text and ":" not in bare:
+            return host, int(port)
+        return host, parsed_port
 
     async def connect_tcp(self, host: str, port: int | None = None) -> dict[str, Any]:
         """Dial a forwarded worker control socket (ngrok tcp / ssh -R)."""
@@ -337,6 +327,19 @@ class Coordinator:
             log.warning("invalid NODE_MANIFEST from %s", node_id, exc_info=1)
             return
         prev = self.store.get_node(node.node_id)
+        parent = self.store.get_node(self.node_id)
+        if (
+            parent is not None
+            and node.node_id != self.node_id
+            and node.devices
+            and (not parent.devices or all(d.backend == "cpu" for d in parent.devices))
+        ):
+            parent.devices = list(node.devices)
+            parent.benchmark_scores = dict(node.benchmark_scores or parent.benchmark_scores)
+            parent.warmup_ms = node.warmup_ms or parent.warmup_ms
+            parent.fp16_tflops = node.fp16_tflops or parent.fp16_tflops
+            parent.supported_kernels = list(node.supported_kernels or parent.supported_kernels)
+            self.store.put_node(parent)
         node.status = "online"
         self.store.put_node(node)
         touch = getattr(self.store, "touch_node", None)

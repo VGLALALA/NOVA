@@ -3,9 +3,30 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def parse_peer(raw: str, *, default_port: int = 7946) -> tuple[str, int]:
+    """Accept host:port, tcp://host:port, or http(s)://host:port."""
+    text = (raw or "").strip()
+    if not text:
+        return "", default_port
+    if "://" in text:
+        parsed = urlparse(text)
+        host = parsed.hostname or ""
+        port = int(parsed.port or default_port)
+        return host, port
+    if text.count(":") >= 1:
+        host, _, port_s = text.rpartition(":")
+        host = host.strip("[]")
+        try:
+            return host, int(port_s)
+        except ValueError:
+            return text, default_port
+    return text, default_port
 
 
 class Settings(BaseSettings):
@@ -43,8 +64,9 @@ class Settings(BaseSettings):
             item = item.strip()
             if not item:
                 continue
-            host, _, port = item.partition(":")
-            out.append((host, int(port or self.control_port)))
+            host, port = parse_peer(item, default_port=self.control_port)
+            if host:
+                out.append((host, port))
         return out
 
     def public_http_url(self) -> str:

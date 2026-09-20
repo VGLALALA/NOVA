@@ -730,7 +730,7 @@ function renderBench(nodes) {
       track.className = "track";
       const fill = document.createElement("div");
       fill.className = `fill ${r.backend}`;
-      fill.style.width = `${Math.max(2, (r.tflops / maxT) * 100)}%`;
+      fill.style.width = `${Math.min(100, Math.max(2, (r.tflops / maxT) * 100))}%`;
       fill.title = `${r.tflops.toFixed(2)} FP16 TFLOPS`;
       track.appendChild(fill);
       const val = document.createElement("div");

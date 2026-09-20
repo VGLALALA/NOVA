@@ -527,10 +527,20 @@ def start(
                 _echo(f"[nova] --simulate-workers {simulate_workers} (display cards only)")
                 _inject_sim_nodes(store, simulate_workers)
                 bus.emit("SYSTEM", message=f"simulated {simulate_workers} workers")
+            peer_addrs = _worker_connect_addrs(settings)
+            if peer_addrs:
+                _echo("[nova] dialing     " + ", ".join(f"{h}:{p}" for h, p in peer_addrs))
+            else:
+                _echo(
+                    "[nova] cluster     standalone — set NOVA_PEERS=host:7946 "
+                    "(or tcp://host:port) to join another node"
+                )
+            if settings.coordinator_url:
+                _echo(f"[nova] png upload {settings.coordinator_url}")
             transport, kind = _make_control(
                 node_id=ident.node_id,
                 listen=True,
-                connect_addrs=_worker_connect_addrs(settings),
+                connect_addrs=peer_addrs,
                 settings=settings,
                 include_pear=True,
             )
@@ -541,6 +551,10 @@ def start(
                 await coordinator.start()
                 fa_app.state.coordinator = coordinator
                 bound = getattr(transport, "bound_port", None) or settings.control_port
+                from nova.hardware import probe_devices
+
+                probed = probe_devices()
+                accel = [d for d in probed if d.backend != "cpu"] or probed
                 self_node = NodeManifest(
                     node_id=ident.node_id,
                     hostname=settings.advertise_host or ident.node_id,
@@ -548,12 +562,14 @@ def start(
                     http_url=settings.public_http_url(),
                     control_host=settings.advertise_host,
                     control_port=int(bound) if bound else settings.control_port,
-                    devices=[],
+                    devices=accel,
                 )
                 store.put_node(self_node)
                 touch = getattr(store, "touch_node", None)
                 if callable(touch):
                     touch(ident.node_id)
+                backends = ",".join(sorted({d.backend for d in accel}))
+                _echo(f"[nova] devices    {backends or 'none'}")
                 _echo(f"[nova] control plane {kind} :{bound}")
             else:
                 try:

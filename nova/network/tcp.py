@@ -145,11 +145,13 @@ class TcpTransport(ControlTransport):
             try:
                 reader, writer = await asyncio.open_connection(host, port)
                 delay = 0.25
+                print(f"[nova] control connected {host}:{port}", flush=True)
                 await self._run_peer(reader, writer)
             except asyncio.CancelledError:
                 raise
             except OSError as exc:
                 logger.warning("control connect %s:%s failed: %s", host, port, exc)
+                print(f"[nova] control connect {host}:{port} failed: {exc}", flush=True)
             if self._stopping:
                 break
             try:

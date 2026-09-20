@@ -31,3 +31,32 @@ def test_public_url_overrides_advertised_http() -> None:
     s = Settings(advertise_host="10.0.0.1", http_port=8080, public_url="https://demo.ngrok-free.app/")
     assert s.public_http_url() == "https://demo.ngrok-free.app"
     assert Settings().public_http_url() == "http://127.0.0.1:8080"
+
+
+def test_peer_list_parses_tcp_url() -> None:
+    s = Settings(peers="tcp://4.tcp.ngrok.io:29805")
+    assert s.peer_list() == [("4.tcp.ngrok.io", 29805)]
+    s2 = Settings(peers="192.168.1.9:7946")
+    assert s2.peer_list() == [("192.168.1.9", 7946)]
+
+
+def test_coordinator_parse_tcp_url() -> None:
+    from nova.clock import Clock, now_utc
+    from nova.coordinator import Coordinator
+    from nova.events import EventBus
+    from nova.models import NodeIdentity
+    from tests.test_coordinator_messages import FakeScheduler, FakeStore, FakeTransport
+
+    store = FakeStore()
+    clock = Clock()
+    coord = Coordinator(
+        store,
+        FakeScheduler(store, clock),
+        FakeTransport(),
+        EventBus(),
+        Settings(),
+        clock,
+        NodeIdentity(node_id="n", created_at=now_utc()),
+    )
+    assert coord._parse_tcp_target("tcp://4.tcp.ngrok.io:29805") == ("4.tcp.ngrok.io", 29805)
+    assert coord._parse_tcp_target("4.tcp.ngrok.io", 29805) == ("4.tcp.ngrok.io", 29805)
