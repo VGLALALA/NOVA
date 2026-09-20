@@ -643,6 +643,9 @@ class Coordinator:
         while self._running:
             try:
                 self._tick()
+                await self.transport.broadcast(
+                    msg(HEARTBEAT, self.node_id, node_id=self.node_id)
+                )
             except Exception:
                 log.exception("coordinator tick failed")
             try:

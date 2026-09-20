@@ -602,10 +602,14 @@ def start(
             ):
                 control_port = getattr(transport, "bound_port", None) or settings.control_port
                 worker_ident = load_or_create(settings.data_dir / "local-worker")
+                worker_addrs = [("127.0.0.1", int(control_port))]
+                for host, port in peer_addrs:
+                    if (host, int(port)) not in worker_addrs:
+                        worker_addrs.append((host, int(port)))
                 worker_transport, worker_kind = _make_control(
                     node_id=worker_ident.node_id,
                     listen=False,
-                    connect_addrs=[("127.0.0.1", int(control_port))],
+                    connect_addrs=worker_addrs,
                     settings=settings,
                     include_pear=False,
                 )
