@@ -370,9 +370,10 @@ def _age_s(store: Any, node_id: str) -> float | None:
 def _live_status(store: Any, node: Any, settings: Settings | None = None) -> tuple[str, float | None]:
     data = _as_dict(node)
     stored = str(data.get("status") or "offline")
+    nid = str(data.get("node_id") or "")
     if stored == "offline":
-        return "offline", _age_s(store, str(data.get("node_id") or ""))
-    age = _age_s(store, str(data.get("node_id") or ""))
+        return "offline", _age_s(store, nid)
+    age = _age_s(store, nid)
     suspect_s = float(getattr(settings, "suspect_s", 15.0) if settings else 15.0)
     offline_s = float(getattr(settings, "offline_s", 30.0) if settings else 30.0)
     if age is None:

@@ -51,6 +51,10 @@ async def test_hello_sends_cluster_roster() -> None:
     sync = next(env for _, env in transport.sent if env.type == CLUSTER_SYNC)
     ids = [n["node_id"] for n in sync.payload["nodes"]]
     assert "mac" in ids
+    got = store.get_node("cuda")
+    assert got is not None
+    assert got.status == "online"
+    assert store.get_last_seen("cuda") is not None
 
 
 @pytest.mark.asyncio

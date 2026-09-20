@@ -156,7 +156,10 @@ class Coordinator:
             log.debug("skip invalid cluster node %s", nid, exc_info=True)
             return None
         existing = self.store.get_node(nid)
+        if node.status != "offline":
+            node.status = "online"
         self.store.put_node(node)
+        self._touch(nid)
         host = node.control_host
         port = node.control_port
         if host and port and self._should_dial_control(str(host), int(port)):
@@ -199,6 +202,7 @@ class Coordinator:
             return
         self._running = True
         await self.transport.start()
+        self._touch(self.node_id)
         self._tick_task = asyncio.create_task(self._tick_loop(), name="nova-coordinator-tick")
 
     async def stop(self) -> None:
@@ -273,7 +277,19 @@ class Coordinator:
         node_id = self._peer_to_node.get(peer_id) or peer_id
         self._handle_disconnect(peer_id, node_id)
 
+    def _touch(self, node_id: str) -> None:
+        if not node_id or node_id.startswith("tmp-"):
+            return
+        fn = getattr(self.store, "touch_node", None)
+        if callable(fn):
+            try:
+                fn(node_id, self.clock.now())
+            except TypeError:
+                fn(node_id)
+
     def _handle_disconnect(self, peer_id: str | None, node_id: str) -> None:
+        if node_id == self.node_id:
+            return
         tasks = self.scheduler.on_disconnect(node_id) or []
         node = self.store.get_node(node_id)
         if node is not None and node.status != "offline":
@@ -333,6 +349,12 @@ class Coordinator:
         version = int(env.payload.get("protocol_version") or env.protocol_version)
         self._map_peer(peer_id, node_id)
         self._protocol_versions[node_id] = version
+        node = self.store.get_node(node_id)
+        if node is None:
+            node = NodeManifest(node_id=node_id, hostname=node_id, status="online")
+        node.status = "online"
+        self.store.put_node(node)
+        self._touch(node_id)
         self.bus.emit("HELLO", node_id=node_id, peer_id=peer_id, protocol_version=version)
         await self._send_cluster_sync(peer_id)
 
@@ -410,6 +432,7 @@ class Coordinator:
 
     def _on_heartbeat(self, peer_id: str, node_id: str, env: Envelope) -> None:
         self._map_peer(peer_id, node_id)
+        self._touch(node_id)
         self.scheduler.on_heartbeat(node_id)
 
     async def ping_workers(self, timeout_s: float = 1.5) -> list[str]:
@@ -605,6 +628,11 @@ class Coordinator:
         self._handle_disconnect(peer_id, node_id)
 
     def _tick(self) -> None:
+        self._touch(self.node_id)
+        node = self.store.get_node(self.node_id)
+        if node is not None and node.status != "online":
+            node.status = "online"
+            self.store.put_node(node)
         self.scheduler.expire_leases()
         self.scheduler.check_node_liveness(
             suspect_s=self.settings.suspect_s,

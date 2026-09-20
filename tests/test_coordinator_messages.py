@@ -90,6 +90,7 @@ class FakeStore:
         self.tasks: dict[str, Task] = {}
         self.nodes: dict[str, NodeManifest] = {}
         self.results: dict[tuple[str, str], Any] = {}
+        self._last_seen: dict[str, datetime] = {}
 
     def put_job(self, job: Job) -> None:
         self.jobs[job.job_id] = job
@@ -120,6 +121,12 @@ class FakeStore:
 
     def list_nodes(self) -> list[NodeManifest]:
         return list(self.nodes.values())
+
+    def touch_node(self, node_id: str, when=None) -> None:
+        self._last_seen[node_id] = when or datetime.now(timezone.utc)
+
+    def get_last_seen(self, node_id: str):
+        return self._last_seen.get(node_id)
 
     def save_result(self, job_id: str, task_id: str, data: bytes, **kwargs: Any) -> None:
         self.results[(job_id, task_id)] = data
