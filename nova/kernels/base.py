@@ -27,24 +27,28 @@ class NovaKernel(ABC):
     def load(self, device: Device) -> None:
         """Load weights onto device. Default is a no-op."""
 
-    def warmup(self, device: Device) -> KernelResult:
-        """Generate one discarded image. Must be called off the asyncio thread."""
-        self.load(device)
-        task = Task(
-            task_id="warmup",
+    def _warmup_task(self, *, task_id: str, seed: int, steps: int) -> Task:
+        return Task(
+            task_id=task_id,
             job_id="warmup",
             shard_index=0,
             kernel_id=self.kernel_id,
             prompt="warmup",
-            seed=0,
-            steps=1,
+            seed=seed,
+            steps=steps,
             width=512,
             height=512,
             min_memory_mb=0,
             allowed_backends=["cuda", "rocm", "metal", "cpu"],
             created_at=now_utc(),
         )
-        return self.execute_sync(task, device)
+
+    def warmup(self, device: Device) -> tuple[KernelResult, KernelResult]:
+        """First image: compile. Second: steady-state generate."""
+        self.load(device)
+        compile_result = self.execute_sync(self._warmup_task(task_id="warmup-compile", seed=0, steps=4), device)
+        steady = self.execute_sync(self._warmup_task(task_id="warmup-steady", seed=1, steps=4), device)
+        return compile_result, steady
 
 
 def gpu_runtime_available() -> bool:

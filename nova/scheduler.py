@@ -8,7 +8,7 @@ from typing import Any
 from nova.clock import Clock
 from nova.events import EventBus
 from nova.jobs import split_job
-from nova.models import Job, NodeManifest, Task
+from nova.models import KERNEL_SD_T2I, Job, NodeManifest, Task
 from nova.protocol import (
     JOB_ANNOUNCE,
     NODE_DISCONNECTED,
@@ -49,8 +49,35 @@ def is_compatible(node: NodeManifest, task: Task) -> bool:
 
 
 def score_node(node: NodeManifest, task: Task) -> float:
-    """Missing benchmark score is 0.1, never KeyError."""
+    """Missing benchmark score is 0.1, never KeyError. Higher = faster generate."""
     return float(node.benchmark_scores.get(task.kernel_id, MISSING_SCORE))
+
+
+def generate_seconds(node: NodeManifest, task: Task | None = None) -> float:
+    """Steady-state seconds per tile. Prefer measured generate_ms."""
+    if node.generate_ms and node.generate_ms > 0:
+        return max(float(node.generate_ms) / 1000.0, 0.05)
+    score = 0.0
+    if task is not None:
+        score = float(node.benchmark_scores.get(task.kernel_id, 0.0) or 0.0)
+    else:
+        scores = node.benchmark_scores or {}
+        score = float(next(iter(scores.values()), 0.0) or 0.0)
+    if score > MISSING_SCORE:
+        return max(1.0 / score, 0.05)
+    return float(DEFAULT_ESTIMATE_S)
+
+
+def node_busy_s(store: Store, node: NodeManifest) -> float:
+    """Estimated remaining generate time already assigned to this node."""
+    per = generate_seconds(node)
+    busy = 0.0
+    for task in store.list_tasks():
+        if task.assigned_node != node.node_id:
+            continue
+        if task.state in IN_FLIGHT:
+            busy += per
+    return busy
 
 
 def lease_seconds_for(
@@ -62,7 +89,7 @@ def lease_seconds_for(
     lease_min_s: int = LEASE_MIN_S,
     lease_max_s: int = LEASE_MAX_S,
 ) -> int:
-    """score = 1000 / latency_ms → estimate_s = 1 / score. Missing/slow (≤0.1) → 15s default.
+    """score = 1000 / generate_ms → estimate_s = 1 / score. Missing/slow (≤0.1) → 15s default.
 
     lease_seconds = clamp(estimate * 2.5, 20, 90)
     """
@@ -127,8 +154,22 @@ def _quota_remaining(store: Store, job: Job, node_id: str) -> int | None:
     return assigned - used
 
 
+def _faster_peer_finishes_sooner(store: Store, node: NodeManifest, task: Task) -> bool:
+    """True if some other online worker would finish this tile sooner (lower wall)."""
+    mine = node_busy_s(store, node) + generate_seconds(node, task)
+    for peer in store.list_nodes():
+        if peer.node_id == node.node_id or peer.status != "online":
+            continue
+        if not is_compatible(peer, task):
+            continue
+        theirs = node_busy_s(store, peer) + generate_seconds(peer, task)
+        if theirs + 0.05 < mine:
+            return True
+    return False
+
+
 def pick_task(store: Store, node: NodeManifest, clock: Clock | None = None) -> Task | None:  # noqa: ARG001
-    """Oldest QUEUED compatible task. One-cycle poison blacklist on last_failed_node."""
+    """Oldest QUEUED compatible task. Skip if a faster peer finishes sooner."""
     if node.status != "online":
         return None
 
@@ -149,6 +190,10 @@ def pick_task(store: Store, node: NodeManifest, clock: Clock | None = None) -> T
                 continue
         if task.last_failed_node == node.node_id:
             poison.append(task)
+            continue
+        if (job is None or (job.scheduler_policy or "adaptive_pull") == "adaptive_pull") and _faster_peer_finishes_sooner(
+            store, node, task
+        ):
             continue
         eligible.append(task)
 
@@ -305,6 +350,21 @@ def on_progress(
     return True
 
 
+def _record_generate_ms(store: Store, node_id: str, execution_ms: int | None) -> None:
+    if not execution_ms or execution_ms <= 0:
+        return
+    node = store.get_node(node_id)
+    if node is None:
+        return
+    prev = node.generate_ms
+    if prev and prev > 0:
+        node.generate_ms = 0.7 * float(prev) + 0.3 * float(execution_ms)
+    else:
+        node.generate_ms = float(execution_ms)
+    node.benchmark_scores[KERNEL_SD_T2I] = 1000.0 / max(float(node.generate_ms), 1.0)
+    store.put_node(node)
+
+
 def on_complete(
     store: Store,
     node_id: str,
@@ -340,6 +400,7 @@ def on_complete(
     task.device_id_used = device_id
     task.execution_ms = execution_ms
     store.put_task(task)
+    _record_generate_ms(store, node_id, execution_ms)
     _refresh_job_state(store, task.job_id, event_bus)
     _emit(
         event_bus,

@@ -93,15 +93,16 @@
           <div class="stat-u">workers</div>
         </div>
       </div>
-      <p class="bench-note">Rank by FP16 TFLOPS (4096² GEMM, 2N³ FLOPs) — that is device peak. Warmup is first SD-Turbo compile, not speed: a cold H100 can look slower than a hot Mac. Score is 1000/warmup_ms (compile), not FLOPS.</p>
+      <p class="bench-note">Compile = first SD-Turbo image. Generate = second image (steady-state). Score = 1000/generate_ms — faster generate ranks higher. FP16 TFLOPS is a 4096² GEMM peak, not UNet latency. Scheduler balances so total generate time per node stays similar.</p>
       <div id="bench-bars" class="bench-bars"></div>
       <table class="bench-table">
         <thead>
           <tr>
             <th>node</th>
             <th>backend</th>
-            <th>warmup</th>
             <th>compile</th>
+            <th>generate</th>
+            <th>score</th>
             <th>FP16 TFLOPS</th>
           </tr>
         </thead>

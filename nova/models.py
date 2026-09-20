@@ -35,6 +35,7 @@ class NodeManifest(BaseModel):
     supported_kernels: list[str] = Field(default_factory=lambda: [KERNEL_SD_T2I])
     benchmark_scores: dict[str, float] = Field(default_factory=dict)
     warmup_ms: float | None = None
+    generate_ms: float | None = None
     fp16_tflops: float | None = None
     max_concurrency: int = 1
     current_slots_used: int = 0

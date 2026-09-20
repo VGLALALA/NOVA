@@ -185,7 +185,7 @@ function renderNodes(nodes) {
     const score = document.createElement("div");
     score.className = "node-score";
     const raw = node.score;
-    score.textContent = typeof raw === "number" ? `compile ${raw.toFixed(2)}` : "compile —";
+    score.textContent = typeof raw === "number" ? `score ${raw.toFixed(2)}` : "score —";
     const st = document.createElement("div");
     st.className = `status ${status}`;
     st.textContent = status;
@@ -776,9 +776,10 @@ function renderBench(nodes) {
     backend: n.primary_backend || "cpu",
     status: n.status,
     score: typeof n.score === "number" ? n.score : null,
-    warmup: typeof n.warmup_ms === "number" ? n.warmup_ms : (typeof n.score === "number" && n.score > 0 ? 1000 / n.score : null),
+    warmup: typeof n.warmup_ms === "number" ? n.warmup_ms : null,
+    generate: typeof n.generate_ms === "number" ? n.generate_ms : (typeof n.score === "number" && n.score > 0 ? 1000 / n.score : null),
     tflops: typeof n.fp16_tflops === "number" ? n.fp16_tflops : 0,
-  })).sort((a, b) => (b.tflops || 0) - (a.tflops || 0));
+  })).sort((a, b) => (b.score || 0) - (a.score || 0));
   const online = rows.filter((r) => r.status === "online");
   const pool = online.reduce((s, r) => s + (r.tflops || 0), 0);
   const fastest = online.reduce((m, r) => Math.max(m, r.tflops || 0), 0);
@@ -814,6 +815,7 @@ function renderBench(nodes) {
       r.id,
       (BACKEND_META[r.backend] || BACKEND_META.cpu).label,
       r.warmup ? `${Math.round(r.warmup)} ms` : "—",
+      r.generate ? `${Math.round(r.generate)} ms` : "—",
       r.score != null ? r.score.toFixed(2) : "—",
       r.tflops ? r.tflops.toFixed(2) : "—",
     ];

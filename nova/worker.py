@@ -210,12 +210,15 @@ class Worker:
 
     async def _warmup(self) -> None:
         device = self._select_device()
-        result = await asyncio.to_thread(self.kernel.warmup, device)
-        latency_ms = max(int(result.execution_ms), 1)
+        compile_result, steady = await asyncio.to_thread(self.kernel.warmup, device)
+        compile_ms = max(int(compile_result.execution_ms), 1)
+        generate_ms = max(int(steady.execution_ms), 1)
         from nova.flops import fp16_tflops
 
-        self.manifest.benchmark_scores[self.kernel.kernel_id] = 1000.0 / latency_ms
-        self.manifest.warmup_ms = float(latency_ms)
+        # Score is inverse of steady-state generate time (second image), not compile.
+        self.manifest.benchmark_scores[self.kernel.kernel_id] = 1000.0 / generate_ms
+        self.manifest.warmup_ms = float(compile_ms)
+        self.manifest.generate_ms = float(generate_ms)
         peak = None
         try:
             from nova.flops import measure_device_fp16_tflops
@@ -224,13 +227,14 @@ class Worker:
         except Exception:
             peak = None
         if peak is None:
-            peak = fp16_tflops(latency_ms, steps=1, width=512, height=512)
+            peak = fp16_tflops(generate_ms, steps=4, width=512, height=512)
         self.manifest.fp16_tflops = round(float(peak), 3)
         logger.info(
-            "warmup %sms on %s score=%.3f fp16_tflops=%.2f",
-            latency_ms,
+            "warmup compile=%sms generate=%sms on %s score=%.3f fp16_tflops=%.2f",
+            compile_ms,
+            generate_ms,
             device.backend,
-            1000.0 / latency_ms,
+            1000.0 / generate_ms,
             self.manifest.fp16_tflops,
         )
 
@@ -320,6 +324,13 @@ class Worker:
         lease_gen = payload.get("lease_gen")
         try:
             result: KernelResult = await asyncio.to_thread(self.kernel.execute_sync, task, device)
+            gen_ms = max(int(result.execution_ms), 1)
+            prev = self.manifest.generate_ms
+            if prev and prev > 0:
+                self.manifest.generate_ms = 0.7 * float(prev) + 0.3 * float(gen_ms)
+            else:
+                self.manifest.generate_ms = float(gen_ms)
+            self.manifest.benchmark_scores[self.kernel.kernel_id] = 1000.0 / max(self.manifest.generate_ms, 1.0)
             await self._put_result(payload, result, lease_gen)
             await self.transport.send(
                 peer_id,
@@ -331,6 +342,7 @@ class Worker:
                     result_url=payload["upload_url"],
                     sha256=result.sha256,
                     execution_ms=result.execution_ms,
+                    generate_ms=self.manifest.generate_ms,
                     lease_gen=lease_gen,
                     backend=result.backend,
                     device_id=result.device_id,

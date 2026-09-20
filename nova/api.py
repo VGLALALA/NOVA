@@ -394,7 +394,16 @@ def _node_payload(node: Any, store: Any | None = None, settings: Settings | None
     data["primary_vendor"] = primary.get("vendor")
     scores = data.get("benchmark_scores") or {}
     data["score"] = scores.get(KERNEL_SD_T2I, scores.get("sd.t2i.v1"))
-    if data.get("fp16_tflops") is None and data.get("warmup_ms"):
+    if data.get("generate_ms") is None and data.get("score"):
+        try:
+            data["generate_ms"] = round(1000.0 / float(data["score"]), 1)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    if data.get("fp16_tflops") is None and data.get("generate_ms"):
+        from nova.flops import fp16_tflops
+
+        data["fp16_tflops"] = round(fp16_tflops(float(data["generate_ms"]), steps=4), 3)
+    elif data.get("fp16_tflops") is None and data.get("warmup_ms"):
         from nova.flops import fp16_tflops
 
         data["fp16_tflops"] = round(fp16_tflops(float(data["warmup_ms"])), 3)
