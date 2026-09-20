@@ -34,6 +34,7 @@ class _Peer:
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     identified: bool = False
     closed: bool = False
+    duplicate: bool = False
 
 
 class TcpTransport(ControlTransport):
@@ -146,7 +147,10 @@ class TcpTransport(ControlTransport):
                 reader, writer = await asyncio.open_connection(host, port)
                 delay = 0.25
                 print(f"[nova] control connected {host}:{port}", flush=True)
-                await self._run_peer(reader, writer)
+                dup = await self._run_peer(reader, writer)
+                if dup:
+                    # Already have this node_id. Do not reconnect-storm the listen port.
+                    return
             except asyncio.CancelledError:
                 raise
             except OSError as exc:
@@ -160,7 +164,7 @@ class TcpTransport(ControlTransport):
                 raise
             delay = min(delay * 2, 5.0)
 
-    async def _run_peer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _run_peer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
         _enable_nodelay(writer)
         temp_id = f"tmp-{uuid.uuid4().hex[:8]}"
         peer = _Peer(peer_id=temp_id, reader=reader, writer=writer)
@@ -181,7 +185,9 @@ class TcpTransport(ControlTransport):
         except Exception:
             logger.exception("peer %s error", peer.peer_id)
         finally:
+            dup = peer.duplicate
             await self._teardown(peer)
+        return dup
 
     async def _read_loop(self, peer: _Peer) -> None:
         buf = b""
@@ -221,8 +227,12 @@ class TcpTransport(ControlTransport):
         real_id = str(env.payload.get("node_id") or env.from_id)
         old_id = peer.peer_id
         existing = self._peers.get(real_id)
-        if existing is not None and existing is not peer:
-            await self._teardown(existing)
+        if existing is not None and existing is not peer and not existing.closed:
+            # Duplicate socket for the same node (loopback + LAN, CLUSTER_SYNC).
+            # Keep the live one; dropping it reconnect-storms the listen port.
+            peer.duplicate = True
+            await self._teardown(peer)
+            return
         if old_id in self._peers and self._peers[old_id] is peer:
             del self._peers[old_id]
         peer.peer_id = real_id

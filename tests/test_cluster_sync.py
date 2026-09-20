@@ -81,3 +81,14 @@ async def test_cluster_sync_ingests_new_node() -> None:
     assert got is not None
     assert got.devices[0].backend == "cuda"
     assert got.control_host == "0.tcp.ngrok.io"
+
+
+def test_is_self_control_skips_loopback() -> None:
+    coord, _, transport = _coord()
+    transport.bound_port = 7946
+    transport.bound_host = "0.0.0.0"
+    assert coord._is_self_control("127.0.0.1", 7946)
+    assert coord._is_self_control("10.0.0.1", 7946)
+    assert not coord._is_self_control("0.tcp.ngrok.io", 12345)
+    assert not coord._should_dial_control("10.128.1.2", 7946)
+    assert coord._should_dial_control("0.tcp.ngrok.io", 12345)

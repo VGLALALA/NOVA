@@ -89,6 +89,33 @@ class Coordinator:
         self.transport.on_peer_disconnect(self.on_peer_disconnect)
         self.transport.on_peer_connect(self.on_peer_connect)
 
+    def _is_self_control(self, host: str, port: int) -> bool:
+        h = (host or "").strip().lower().strip("[]")
+        bound = int(getattr(self.transport, "bound_port", None) or self.settings.control_port or 0)
+        if int(port) != bound:
+            return False
+        mine = {
+            "127.0.0.1",
+            "localhost",
+            "0.0.0.0",
+            "::",
+            "::1",
+            str(self.settings.advertise_host or "").strip().lower(),
+            str(getattr(self.transport, "bound_host", None) or "").strip().lower(),
+        }
+        return h in mine
+
+    def _should_dial_control(self, host: str, port: int) -> bool:
+        """Dial public hostnames / ngrok. Skip self and RFC1918 (RunPod 10.x)."""
+        if self._is_self_control(host, port):
+            return False
+        h = (host or "").strip().lower().strip("[]")
+        if not h or h in {"localhost", "0.0.0.0", "127.0.0.1", "::1", "::"}:
+            return False
+        if h.startswith("10.") or h.startswith("192.168.") or h.startswith("172."):
+            return False
+        return True
+
     def _self_snapshot(self) -> dict[str, Any]:
         node = self.store.get_node(self.node_id)
         if node is None:
@@ -132,7 +159,7 @@ class Coordinator:
         self.store.put_node(node)
         host = node.control_host
         port = node.control_port
-        if host and port:
+        if host and port and self._should_dial_control(str(host), int(port)):
             add = getattr(self.transport, "add_connect", None)
             if callable(add):
                 try:

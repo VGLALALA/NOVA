@@ -136,6 +136,17 @@ class Worker:
                     host = raw.get("control_host") or raw.get("host")
                     port = raw.get("control_port") or raw.get("port")
                     if host and port:
+                        h = str(host).strip().lower().strip("[]")
+                        mine = {
+                            "127.0.0.1",
+                            "localhost",
+                            "0.0.0.0",
+                            "::1",
+                            "::",
+                            str(self.settings.advertise_host or "").strip().lower(),
+                        }
+                        if h in mine or h.startswith("10.") or h.startswith("192.168.") or h.startswith("172."):
+                            continue
                         add = getattr(self.transport, "add_connect", None)
                         if callable(add):
                             try:
