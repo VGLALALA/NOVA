@@ -821,3 +821,19 @@ async def test_submit_job_with_job_object_when_splitter_present(coord: Coordinat
 async def test_ignore_self_messages(coord: Coordinator, bus: EventBus):
     await coord.handle_message(PEER, msg(HELLO, coord.node_id, node_id=coord.node_id))
     assert "HELLO" not in event_types(bus)
+
+
+async def test_ping_workers_does_not_offline_silent_nodes(
+    coord: Coordinator, store: FakeStore, scheduler: FakeScheduler
+):
+    store.put_node(make_node())
+    store.touch_node(WORKER)
+    live = await coord.ping_workers(timeout_s=0.2)
+    assert WORKER in live
+    assert scheduler.disconnects == []
+    assert store.get_node(WORKER).status == "online"
+
+
+def test_offer_http_base_prefers_public_url(coord: Coordinator):
+    coord.settings = Settings(advertise_host="10.39.6.180", http_port=8080, public_url="https://demo.ngrok-free.app/")
+    assert coord._offer_http_base() == "https://demo.ngrok-free.app"

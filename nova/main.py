@@ -496,6 +496,15 @@ def start(
     typer.secho(f"[nova] dashboard  {public}", fg="green", bold=True)
     _echo(f"[nova] health     {public}/health")
     _echo(f"[nova] control    {settings.advertise_host}:{settings.control_port}")
+    host = (settings.advertise_host or "").strip()
+    if not settings.public_url and (
+        host.startswith("10.") or host.startswith("192.168.") or host.startswith("172.")
+    ):
+        _echo(
+            "[nova] warning    NOVA_PUBLIC_URL unset — remote CUDA cannot PUT tiles to "
+            f"http://{host}:{settings.http_port}. Set it to the ngrok https URL.",
+            err=True,
+        )
     if stub:
         _echo("[nova] coordinator modules incomplete — HTTP/dashboard still up")
 

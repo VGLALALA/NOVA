@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -9,7 +10,18 @@ import pytest
 from nova.config import Settings
 from nova.kernels.dummy import DummyKernel
 from nova.models import Device, NodeIdentity
-from nova.protocol import TASK_ACCEPT, TASK_COMPLETE, TASK_FAILED, TASK_OFFER, TASK_STARTED, Envelope, msg
+from nova.protocol import (
+    CLUSTER_SYNC,
+    JOB_ANNOUNCE,
+    TASK_ACCEPT,
+    TASK_COMPLETE,
+    TASK_FAILED,
+    TASK_OFFER,
+    TASK_STARTED,
+    WORK_REQUEST,
+    Envelope,
+    msg,
+)
 from nova.worker import Worker
 from tests.conftest import FakeClock
 
@@ -252,3 +264,54 @@ async def test_ignored_put_sends_failed_not_complete(tmp_path) -> None:
     assert TASK_COMPLETE not in _types(transport)
     failed = next(env for _peer, env in transport.sent if env.type == TASK_FAILED)
     assert "not accepted" in failed.payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_idle_worker_broadcasts_work_request_not_pinned(tmp_path) -> None:
+    worker, transport = _worker(tmp_path, FakeHttp(FakeResponse(200, {"status": "accepted"})))
+    worker.coordinator_id = "local-coord"
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(worker._control_loop())
+    await asyncio.sleep(0.05)
+    worker._stop.set()
+    await task
+    assert transport.sent == []
+    assert any(env.type == WORK_REQUEST for env in transport.broadcasts)
+    req = next(env for env in transport.broadcasts if env.type == WORK_REQUEST)
+    assert req.payload["node_id"] == "nova-worker"
+    assert req.payload["available_slots"] == 1
+
+
+def test_rewrite_lan_upload_url_to_public_base(tmp_path) -> None:
+    worker, _transport = _worker(tmp_path, FakeHttp(FakeResponse(200, {"status": "accepted"})))
+    worker._http_base = "https://demo.ngrok-free.app"
+    lan = "http://10.39.6.180:8080/jobs/job-1/tasks/t-1/result"
+    assert worker._resolve_upload_url(lan) == "https://demo.ngrok-free.app/jobs/job-1/tasks/t-1/result"
+    public = "https://demo.ngrok-free.app/jobs/job-1/tasks/t-1/result"
+    assert worker._resolve_upload_url(public) == public
+
+
+@pytest.mark.asyncio
+async def test_cluster_sync_prefers_public_http_base(tmp_path) -> None:
+    worker, _transport = _worker(tmp_path, FakeHttp(FakeResponse(200, {"status": "accepted"})))
+    worker._http_base = "http://10.128.1.2:8080"
+    await worker.handle_message(
+        "peer",
+        msg(
+            CLUSTER_SYNC,
+            "coord",
+            nodes=[{"http_url": "https://demo.ngrok-free.app", "control_host": "10.0.0.1", "control_port": 7946}],
+        ),
+    )
+    assert worker._http_base == "https://demo.ngrok-free.app"
+
+
+@pytest.mark.asyncio
+async def test_job_announce_sets_public_http_base(tmp_path) -> None:
+    worker, _transport = _worker(tmp_path, FakeHttp(FakeResponse(200, {"status": "accepted"})))
+    await worker.handle_message(
+        "mac-coord",
+        msg(JOB_ANNOUNCE, "mac-coord", coordinator_url="https://demo.ngrok-free.app", http_url="http://10.39.6.180:8080"),
+    )
+    assert worker.coordinator_id == "mac-coord"
+    assert worker._http_base == "https://demo.ngrok-free.app"

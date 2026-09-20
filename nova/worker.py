@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -16,6 +17,7 @@ from nova.kernels import load_kernel
 from nova.kernels.base import NovaKernel
 from nova.models import Device, KernelResult, NodeIdentity, NodeManifest, Task
 from nova.network.transport import ControlTransport
+
 from nova.protocol import (
     CLUSTER_SYNC,
     HELLO,
@@ -37,6 +39,24 @@ from nova.protocol import (
 )
 
 logger = logging.getLogger("nova.worker")
+
+
+def _is_private_http_url(url: str) -> bool:
+    """True for loopback / RFC1918 HTTP bases that a remote GPU cannot PUT to."""
+    host = (urlparse(url).hostname or "").strip().lower().strip("[]")
+    if not host:
+        return True
+    if host in {"localhost", "0.0.0.0", "127.0.0.1", "::1", "::"}:
+        return True
+    if host.startswith("10.") or host.startswith("192.168."):
+        return True
+    if host.startswith("172."):
+        parts = host.split(".")
+        try:
+            return 16 <= int(parts[1]) <= 31
+        except (IndexError, ValueError):
+            return False
+    return False
 
 
 class Worker:
@@ -135,6 +155,9 @@ class Worker:
                         continue
                     host = raw.get("control_host") or raw.get("host")
                     port = raw.get("control_port") or raw.get("port")
+                    url = raw.get("http_url")
+                    if url:
+                        self._remember_http_base(str(url))
                     if host and port:
                         h = str(host).strip().lower().strip("[]")
                         mine = {
@@ -153,14 +176,11 @@ class Worker:
                                 add(str(host), int(port))
                             except Exception:
                                 logger.debug("cluster dial failed", extra={"host": host, "port": port})
-                    url = raw.get("http_url")
-                    if url and not self._http_base:
-                        self._http_base = str(url)
         elif env.type == "JOB_ANNOUNCE":
             self.coordinator_id = peer_id
             url = env.payload.get("coordinator_url") or env.payload.get("http_url")
             if url:
-                self._http_base = url
+                self._remember_http_base(str(url))
 
     async def _on_connect(self, peer_id: str) -> None:
         self.coordinator_id = self.coordinator_id or peer_id
@@ -243,7 +263,10 @@ class Worker:
                 )
                 last_progress = now
             if self.slots_used < self.max_concurrency and self._current is None:
-                await self._send_to_coord(
+                # Broadcast so a remote job owner can lease us. Pinning to the
+                # first HELLO peer (often this box's own coordinator) leaves
+                # CUDA asking an empty local store while Metal finishes the job.
+                await self.transport.broadcast(
                     msg(
                         WORK_REQUEST,
                         self.node_id,
@@ -328,7 +351,7 @@ class Worker:
             self._compute_task = None
 
     async def _put_result(self, payload: dict[str, Any], result: KernelResult, lease_gen: Any) -> bool:
-        url = payload.get("upload_url")
+        url = self._resolve_upload_url(str(payload.get("upload_url") or ""))
         if not url:
             raise RuntimeError("result upload requires upload_url")
         if self._http is None:
@@ -364,6 +387,26 @@ class Worker:
             await self.transport.send(self.coordinator_id, env)
         else:
             await self.transport.broadcast(env)
+
+    def _remember_http_base(self, url: str) -> None:
+        text = (url or "").strip().rstrip("/")
+        if not text:
+            return
+        if not self._http_base or _is_private_http_url(self._http_base):
+            if not _is_private_http_url(text) or not self._http_base:
+                self._http_base = text
+
+    def _resolve_upload_url(self, url: str) -> str:
+        text = (url or "").strip()
+        if not text:
+            return text
+        if not _is_private_http_url(text) or not self._http_base:
+            return text
+        parsed = urlparse(text)
+        path = parsed.path or ""
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        return f"{str(self._http_base).rstrip('/')}{path}"
 
 
 def _task_from_offer(payload: dict[str, Any]) -> Task:

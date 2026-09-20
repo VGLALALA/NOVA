@@ -6,6 +6,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from nova.clock import Clock
 from nova.config import Settings
@@ -436,14 +437,14 @@ class Coordinator:
         self.scheduler.on_heartbeat(node_id)
 
     async def ping_workers(self, timeout_s: float = 1.5) -> list[str]:
-        """Broadcast NODE_PING; mark silent nodes offline. Returns live node ids."""
+        """Broadcast NODE_PING. Do not mark silent nodes offline.
+
+        Ngrok TCP RTT is often >1.5s. Job submit used this as a liveness gate
+        and offlined the CUDA worker before it could pull a tile. Heartbeat
+        timeout / NODE_DISCONNECTED still handle real deaths.
+        """
         from nova.clock import now_utc
 
-        nodes = list(self.store.list_nodes())
-        before = {
-            n.node_id: self.store.get_last_seen(n.node_id) if hasattr(self.store, "get_last_seen") else None
-            for n in nodes
-        }
         pinged_at = now_utc()
         try:
             await self.transport.broadcast(msg(NODE_PING, self.node_id, ts=pinged_at.isoformat()))
@@ -452,17 +453,23 @@ class Coordinator:
         await asyncio.sleep(max(timeout_s, 0.2))
         live: list[str] = []
         for node in self.store.list_nodes():
-            seen = self.store.get_last_seen(node.node_id) if hasattr(self.store, "get_last_seen") else None
-            prev = before.get(node.node_id)
-            if seen is not None and (prev is None or seen > prev or seen >= pinged_at):
-                if node.status != "online":
-                    node.status = "online"
-                    self.store.put_node(node)
+            if node.status == "online":
                 live.append(node.node_id)
-                continue
-            if node.status != "offline":
-                self.scheduler.on_disconnect(node.node_id)
         return live
+
+    def _offer_http_base(self) -> str:
+        """Prefer a public HTTP base so remote CUDA can PUT PNG bytes."""
+        public = (self.settings.public_url or "").strip().rstrip("/")
+        if public:
+            return public
+        url = self.settings.public_http_url().rstrip("/")
+        host = (urlparse(url).hostname or "").strip().lower()
+        if host.startswith("10.") or host.startswith("192.168.") or host.startswith("172."):
+            log.warning(
+                "TASK_OFFER upload_url is RFC1918 (%s); set NOVA_PUBLIC_URL so remote CUDA can PUT tiles",
+                url,
+            )
+        return url
 
     async def _on_work_request(self, peer_id: str, node_id: str, env: Envelope) -> None:
         node = self.store.get_node(node_id)
@@ -480,7 +487,7 @@ class Coordinator:
         await self._send_task_offer(peer_id, node_id, leased, seconds)
 
     async def _send_task_offer(self, peer_id: str, node_id: str, task: Task, lease_seconds: int) -> None:
-        base = self.settings.public_http_url().rstrip("/")
+        base = self._offer_http_base().rstrip("/")
         job_id = task.job_id
         task_id = task.task_id
         env = msg(
@@ -682,8 +689,8 @@ class Coordinator:
                 job_type=job.job_type,
                 kernel_id=job.kernel_id,
                 task_count=len(tasks),
-                coordinator_url=self.settings.public_http_url(),
-                http_url=self.settings.public_http_url(),
+                coordinator_url=self._offer_http_base(),
+                http_url=self._offer_http_base(),
                 width=req.width,
                 height=req.height,
                 steps=req.steps,
