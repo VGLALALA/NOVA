@@ -19,7 +19,8 @@
       <nav class="tabs" role="tablist" aria-label="views">
         <button id="tab-gallery" type="button" class="tab active" role="tab" aria-selected="true">Gallery</button>
         <button id="tab-bench" type="button" class="tab" role="tab" aria-selected="false">Benchmark</button>
-        <button id="tab-nodes" type="button" class="tab" role="tab" aria-selected="false">Nodes</button>
+        <button id="tab-coords" type="button" class="tab" role="tab" aria-selected="false">Coordinators</button>
+        <button id="tab-workers" type="button" class="tab" role="tab" aria-selected="false">Workers</button>
       </nav>
       <div id="link-state" class="link poll">POLL</div>
     </header>
@@ -108,9 +109,22 @@
       </table>
     </section>
 
-    <section id="view-nodes" class="view hidden" hidden>
-      <section class="dispatch node-ctl" aria-label="node control">
-        <p class="bench-note" style="padding:0 0 12px">Add a worker by its forwarded control TCP (ngrok tcp, ssh -R, cloud public IP). Workers still pull tasks; this only opens the control socket. Remove drops the peer and requeues its leases.</p>
+    <section id="view-coords" class="view hidden" hidden>
+      <section class="dispatch node-ctl" aria-label="coordinator roster">
+        <p class="bench-note" style="padding:0 0 12px">HTTP job owners. Each <code>nova start</code> box advertises a coordinator here so peers learn the PNG upload URL. They do not render tiles.</p>
+      </section>
+      <div id="coord-cards" class="node-cards ctl-cards"></div>
+      <table class="bench-table">
+        <thead>
+          <tr><th>node</th><th>http</th><th>status</th><th>last ping</th></tr>
+        </thead>
+        <tbody id="coord-body"></tbody>
+      </table>
+    </section>
+
+    <section id="view-workers" class="view hidden" hidden>
+      <section class="dispatch node-ctl" aria-label="worker control">
+        <p class="bench-note" style="padding:0 0 12px">GPU pull clients. Add one by forwarded control TCP (ngrok tcp, ssh -R). Remove drops the peer and requeues its leases.</p>
         <div class="dispatch-row">
           <label class="seed-label grow">host:port
             <input id="tcp-target" type="text" placeholder="0.tcp.ngrok.io:12345" />

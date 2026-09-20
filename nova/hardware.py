@@ -130,7 +130,9 @@ def probe_devices() -> list[Device]:
     if torch is not None:
         devices.extend(_probe_cuda(torch))
         devices.extend(_probe_mps(torch))
-    devices.append(_cpu_device())
+    # NVIDIA / AMD boxes must not list CPU — a CUDA node never falls back to CPU.
+    if not any(d.backend in ("cuda", "rocm") for d in devices):
+        devices.append(_cpu_device())
     return devices
 
 

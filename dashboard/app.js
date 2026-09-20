@@ -30,10 +30,14 @@ const els = {
   dispatchStatus: document.getElementById("dispatch-status"),
   tabGallery: document.getElementById("tab-gallery"),
   tabBench: document.getElementById("tab-bench"),
-  tabNodes: document.getElementById("tab-nodes"),
+  tabCoords: document.getElementById("tab-coords"),
+  tabWorkers: document.getElementById("tab-workers"),
   viewGallery: document.getElementById("view-gallery"),
   viewBench: document.getElementById("view-bench"),
-  viewNodes: document.getElementById("view-nodes"),
+  viewCoords: document.getElementById("view-coords"),
+  viewWorkers: document.getElementById("view-workers"),
+  coordCards: document.getElementById("coord-cards"),
+  coordBody: document.getElementById("coord-body"),
   tcpTarget: document.getElementById("tcp-target"),
   addTcp: document.getElementById("add-tcp"),
   pingNodes: document.getElementById("ping-nodes"),
@@ -115,11 +119,27 @@ function backendOf(node) {
   return node.primary_backend || primaryDevice(node).backend || "cpu";
 }
 
+function isWorker(node) {
+  return typeof node.warmup_ms === "number" || !node.http_url;
+}
+
+function isCoordinator(node) {
+  return Boolean(node.http_url) && typeof node.warmup_ms !== "number";
+}
+
+function splitRoster(nodes) {
+  const workers = nodes.filter(isWorker);
+  const coords = nodes.filter(isCoordinator);
+  return { workers, coords };
+}
+
 function renderHeader(system, nodes) {
-  const n = (system && typeof system.nodes === "number") ? system.nodes : nodes.length;
+  const { workers, coords } = splitRoster(nodes);
   const backends = (system && system.backends) || [];
-  const present = new Set(backends.length ? backends : nodes.map(backendOf));
-  els.nodeLine.textContent = n === 1 ? "1 node" : `${n} nodes`;
+  const present = new Set(backends.length ? backends : workers.map(backendOf));
+  const w = workers.length;
+  const c = coords.length;
+  els.nodeLine.textContent = `${w} worker${w === 1 ? "" : "s"} · ${c} coordinator${c === 1 ? "" : "s"}`;
   els.badges.replaceChildren();
   BACKEND_ORDER.forEach((key) => {
     if (!present.has(key)) return;
@@ -384,12 +404,14 @@ async function refresh() {
     ]);
     const nodes = asList(nodesRaw);
     const jobs = asList(jobsRaw);
+    const { workers, coords } = splitRoster(nodes);
     renderHeader(system, nodes);
-    renderNodes(nodes);
-    renderBench(nodes);
-    renderNodeControl(nodes);
-    syncQuotaInputs(nodes);
-    const online = nodes.filter((n) => (n.status || "") === "online").length;
+    renderNodes(workers);
+    renderBench(workers);
+    renderNodeControl(workers);
+    renderCoordinators(coords);
+    syncQuotaInputs(workers);
+    const online = workers.filter((n) => (n.status || "") === "online").length;
     if (!lastJobId && els.dispatchStatus && !els.dispatchStatus.dataset.locked) {
       setDispatch(online ? `${online} worker${online === 1 ? "" : "s"} ready` : "waiting for workers");
     }
@@ -535,12 +557,14 @@ function showView(name) {
   const views = {
     gallery: els.viewGallery,
     bench: els.viewBench,
-    nodes: els.viewNodes,
+    coords: els.viewCoords,
+    workers: els.viewWorkers,
   };
   const tabs = {
     gallery: els.tabGallery,
     bench: els.tabBench,
-    nodes: els.tabNodes,
+    coords: els.tabCoords,
+    workers: els.tabWorkers,
   };
   Object.keys(views).forEach((key) => {
     const on = key === name;
@@ -555,6 +579,49 @@ function showView(name) {
       tab.setAttribute("aria-selected", on ? "true" : "false");
     }
   });
+}
+
+function renderCoordinators(nodes) {
+  if (els.coordBody) {
+    els.coordBody.replaceChildren();
+    if (!nodes.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 4;
+      td.textContent = "No coordinators advertised.";
+      tr.appendChild(td);
+      els.coordBody.appendChild(tr);
+    } else {
+      nodes.forEach((node) => {
+        const tr = document.createElement("tr");
+        const status = node.display_status || node.status || "LOST";
+        [node.node_id, node.http_url || "—", status, node.last_seen_s == null ? "never" : `${node.last_seen_s.toFixed(0)}s ago`].forEach((text) => {
+          const td = document.createElement("td");
+          td.textContent = text;
+          tr.appendChild(td);
+        });
+        els.coordBody.appendChild(tr);
+      });
+    }
+  }
+  if (els.coordCards) {
+    els.coordCards.replaceChildren();
+    nodes.forEach((node) => {
+      const card = document.createElement("article");
+      card.className = `node-card ${backendOf(node)}`;
+      const model = document.createElement("div");
+      model.className = "node-model";
+      model.textContent = node.node_id;
+      const sub = document.createElement("div");
+      sub.className = "node-sub";
+      sub.textContent = node.http_url || "no http_url";
+      const st = document.createElement("div");
+      st.className = `status ${node.display_status || ({ online: "ACTIVE", suspect: "SUSPECT", offline: "LOST" }[node.status] || "LOST")}`;
+      st.textContent = node.display_status || ({ online: "ACTIVE", suspect: "SUSPECT", offline: "LOST" }[node.status] || "LOST");
+      card.append(model, sub, st);
+      els.coordCards.appendChild(card);
+    });
+  }
 }
 
 function renderNodeControl(nodes) {
@@ -764,7 +831,8 @@ if (els.sendCustom) els.sendCustom.addEventListener("click", sendCustom);
 if (els.cancelJob) els.cancelJob.addEventListener("click", cancelCurrent);
 if (els.tabGallery) els.tabGallery.addEventListener("click", () => showView("gallery"));
 if (els.tabBench) els.tabBench.addEventListener("click", () => showView("bench"));
-if (els.tabNodes) els.tabNodes.addEventListener("click", () => showView("nodes"));
+if (els.tabCoords) els.tabCoords.addEventListener("click", () => showView("coords"));
+if (els.tabWorkers) els.tabWorkers.addEventListener("click", () => showView("workers"));
 if (els.addTcp) els.addTcp.addEventListener("click", addTcpNode);
 if (els.pingNodes) els.pingNodes.addEventListener("click", pingNow);
 if (els.tcpTarget) {

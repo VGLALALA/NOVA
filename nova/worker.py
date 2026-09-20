@@ -188,7 +188,12 @@ class Worker:
 
     def _select_device(self, allowed_backends: list[str] | None = None) -> Device:
         if allowed_backends is not None:
-            device = preferred_device(self.devices, allowed_backends)
+            allowed = list(allowed_backends)
+            if any(d.backend in ("cuda", "rocm") for d in self.devices):
+                allowed = [b for b in allowed if b in ("cuda", "rocm")] or ["cuda", "rocm"]
+            elif any(d.backend == "metal" for d in self.devices):
+                allowed = [b for b in allowed if b == "metal"] or ["metal"]
+            device = preferred_device(self.devices, allowed)
             if device is None:
                 raise RuntimeError(f"no device compatible with {allowed_backends}")
             return device
