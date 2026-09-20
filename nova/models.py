@@ -39,7 +39,9 @@ class NodeManifest(BaseModel):
     max_concurrency: int = 1
     current_slots_used: int = 0
     status: NodeStatus = "online"
-    http_url: str | None = None  # coordinator announces; workers cache this
+    http_url: str | None = None  # this node's dashboard / PNG base
+    control_host: str | None = None
+    control_port: int | None = None
 
 
 class PromptSpec(BaseModel):

@@ -65,20 +65,16 @@ A Hugging Face snapshot under `models/sd-turbo/` (with `model_index.json`) is pr
 Jobs are already sharded: 24 independent 512×512 tiles, one lease per free slot. A Mac still generates on Metal (fp16, VAE slice/tile, attention slicing, MPS cache released after each tile). If a node OOMs, that tile fails closed and another worker pulls it — the Mac does not have to finish the gallery alone. Tight unified memory: run `nova dashboard` on the Mac and `nova worker` on the GPU boxes.
 
 ```bash
-# submitter / projector — job dashboard service (HTTP + scheduler, no local GPU)
-nova dashboard
+# every box (Mac, CUDA, ROCm) — same client
+nova start
 
-# GPU machines — worker service
-# Pear discovers the coordinator on the shared NOVA_SWARM_TOPIC.
-# Typed-IP fallback if Hyperswarm fails:
-NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova worker
-# equivalent:
-# NOVA_ROLE=worker NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova start --worker
+# join an existing cluster (typed fallback if Pear is missing)
+NOVA_COORDINATOR_URL=http://192.168.x.x:8080 NOVA_PEERS=192.168.x.x:7946 nova start
 ```
 
 On the dashboard: **Gallery** tab to dispatch, **Benchmark** tab for per-node FP16 TFLOPS (from warmup). Set **tiles**, then **finish ASAP** (adaptive pull) or **assign per node** (quota). Click **Send gallery**. `nova run demo/gallery.yaml` still works from a terminal.
 
-`nova start` remains the one-process demo (dashboard + local worker). `nova dashboard` / `nova worker` are the two long-running services.
+Every machine is the same client: `nova start` = dashboard **and** local GPU worker. Send gallery on any node; tiles still pull from whoever is free. `CLUSTER_SYNC` ships the roster on join so a new node learns everyone and everyone learns the new node (`http_url` + `control_host:port`). `nova dashboard` / `nova worker` remain available if you want to split roles.
 
 ## Services
 

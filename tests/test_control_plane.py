@@ -18,7 +18,7 @@ def test_make_tcp_listen_and_connect() -> None:
     )
     assert isinstance(worker, TcpTransport)
     assert worker.listen_host is None
-    assert worker.connect_addrs == [("127.0.0.1", 7946)]
+    assert ("127.0.0.1", 7946) in worker.connect_addrs
 
 
 def test_make_control_tcp_only_when_pear_unavailable(monkeypatch) -> None:

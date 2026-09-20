@@ -15,6 +15,7 @@ from nova.network.transport import ControlTransport
 from nova.protocol import (
     HEARTBEAT,
     HELLO,
+    CLUSTER_SYNC,
     JOB_ANNOUNCE,
     NODE_DISCONNECTED,
     NODE_PING,
@@ -87,6 +88,84 @@ class Coordinator:
         self.transport.on_message(self.handle_message)
         self.transport.on_peer_disconnect(self.on_peer_disconnect)
         self.transport.on_peer_connect(self.on_peer_connect)
+
+    def _self_snapshot(self) -> dict[str, Any]:
+        node = self.store.get_node(self.node_id)
+        if node is None:
+            return {
+                "node_id": self.node_id,
+                "hostname": "",
+                "status": "online",
+                "http_url": self.settings.public_http_url(),
+                "control_host": self.settings.advertise_host,
+                "control_port": getattr(self.transport, "bound_port", None) or self.settings.control_port,
+            }
+        data = node.model_dump(mode="json")
+        data.setdefault("http_url", self.settings.public_http_url())
+        data.setdefault("control_port", getattr(self.transport, "bound_port", None) or self.settings.control_port)
+        data.setdefault("control_host", self.settings.advertise_host)
+        return data
+
+    def _cluster_nodes(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        self_dump = self._self_snapshot()
+        out.append(self_dump)
+        seen.add(str(self_dump.get("node_id") or self.node_id))
+        for node in self.store.list_nodes():
+            if node.node_id in seen:
+                continue
+            seen.add(node.node_id)
+            out.append(node.model_dump(mode="json"))
+        return out
+
+    def _ingest_cluster_node(self, raw: dict[str, Any]) -> NodeManifest | None:
+        nid = str(raw.get("node_id") or "")
+        if not nid or nid == self.node_id:
+            return None
+        try:
+            node = NodeManifest.model_validate(raw)
+        except Exception:
+            log.debug("skip invalid cluster node %s", nid, exc_info=True)
+            return None
+        existing = self.store.get_node(nid)
+        self.store.put_node(node)
+        host = node.control_host
+        port = node.control_port
+        if host and port:
+            add = getattr(self.transport, "add_connect", None)
+            if callable(add):
+                try:
+                    add(str(host), int(port))
+                except Exception:
+                    log.debug("cluster dial %s:%s failed", host, port, exc_info=True)
+        if existing is None or existing.status != node.status:
+            self.bus.emit(
+                NODE_MANIFEST,
+                node_id=node.node_id,
+                hostname=node.hostname,
+                status=node.status,
+                backends=[d.backend for d in node.devices],
+            )
+        return node
+
+    async def _send_cluster_sync(self, peer_id: str) -> None:
+        await self.transport.send(
+            peer_id,
+            msg(CLUSTER_SYNC, self.node_id, nodes=self._cluster_nodes()),
+        )
+
+    async def _broadcast_cluster_sync(self) -> None:
+        await self.transport.broadcast(msg(CLUSTER_SYNC, self.node_id, nodes=self._cluster_nodes()))
+
+    async def _on_cluster_sync(self, peer_id: str, node_id: str, env: Envelope) -> None:
+        nodes = env.payload.get("nodes") or []
+        if not isinstance(nodes, list):
+            return
+        for raw in nodes:
+            if isinstance(raw, dict):
+                self._ingest_cluster_node(raw)
+        self.bus.emit("CLUSTER_SYNC", from_id=node_id, count=len(nodes))
 
     async def start(self) -> None:
         if self._running:
@@ -223,6 +302,7 @@ class Coordinator:
             TASK_COMPLETE: self._on_task_complete,
             TASK_FAILED: self._on_task_failed,
             NODE_GOODBYE: self._on_goodbye,
+            CLUSTER_SYNC: self._on_cluster_sync,
         }.get(env.type)
         if handler is None:
             log.debug("ignoring %s from %s", env.type, node_id)
@@ -231,12 +311,13 @@ class Coordinator:
         if asyncio.iscoroutine(result):
             await result
 
-    def _on_hello(self, peer_id: str, node_id: str, env: Envelope) -> None:
+    async def _on_hello(self, peer_id: str, node_id: str, env: Envelope) -> None:
         node_id = str(env.payload.get("node_id") or env.from_id)
         version = int(env.payload.get("protocol_version") or env.protocol_version)
         self._map_peer(peer_id, node_id)
         self._protocol_versions[node_id] = version
         self.bus.emit("HELLO", node_id=node_id, peer_id=peer_id, protocol_version=version)
+        await self._send_cluster_sync(peer_id)
 
     def _payload_node_data(self, env: Envelope, node_id: str) -> dict[str, Any]:
         raw: dict[str, Any] = dict(env.payload)
@@ -248,12 +329,12 @@ class Coordinator:
         raw.setdefault("node_id", node_id)
         return raw
 
-    def _on_node_manifest(self, peer_id: str, node_id: str, env: Envelope) -> None:
+    async def _on_node_manifest(self, peer_id: str, node_id: str, env: Envelope) -> None:
         data = self._payload_node_data(env, node_id)
         try:
             node = NodeManifest.model_validate(data)
         except Exception:
-            log.warning("invalid NODE_MANIFEST from %s", node_id, exc_info=True)
+            log.warning("invalid NODE_MANIFEST from %s", node_id, exc_info=1)
             return
         prev = self.store.get_node(node.node_id)
         node.status = "online"
@@ -271,6 +352,7 @@ class Coordinator:
             status=node.status,
             backends=[d.backend for d in node.devices],
         )
+        await self._broadcast_cluster_sync()
 
     def _on_node_update(self, peer_id: str, node_id: str, env: Envelope) -> None:
         data = self._payload_node_data(env, node_id)

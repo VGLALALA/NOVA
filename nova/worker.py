@@ -17,6 +17,7 @@ from nova.kernels.base import NovaKernel
 from nova.models import Device, KernelResult, NodeIdentity, NodeManifest, Task
 from nova.network.transport import ControlTransport
 from nova.protocol import (
+    CLUSTER_SYNC,
     HELLO,
     HEARTBEAT,
     NODE_GOODBYE,
@@ -126,6 +127,24 @@ class Worker:
                 peer_id,
                 msg(HEARTBEAT, self.node_id, node_id=self.node_id, ping=True),
             )
+        elif env.type == CLUSTER_SYNC:
+            nodes = env.payload.get("nodes") or []
+            if isinstance(nodes, list):
+                for raw in nodes:
+                    if not isinstance(raw, dict):
+                        continue
+                    host = raw.get("control_host") or raw.get("host")
+                    port = raw.get("control_port") or raw.get("port")
+                    if host and port:
+                        add = getattr(self.transport, "add_connect", None)
+                        if callable(add):
+                            try:
+                                add(str(host), int(port))
+                            except Exception:
+                                logger.debug("cluster dial failed", extra={"host": host, "port": port})
+                    url = raw.get("http_url")
+                    if url and not self._http_base:
+                        self._http_base = str(url)
         elif env.type == "JOB_ANNOUNCE":
             self.coordinator_id = peer_id
             url = env.payload.get("coordinator_url") or env.payload.get("http_url")

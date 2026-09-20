@@ -530,7 +530,7 @@ def start(
             transport, kind = _make_control(
                 node_id=ident.node_id,
                 listen=True,
-                connect_addrs=[],
+                connect_addrs=_worker_connect_addrs(settings),
                 settings=settings,
                 include_pear=True,
             )
@@ -541,6 +541,19 @@ def start(
                 await coordinator.start()
                 fa_app.state.coordinator = coordinator
                 bound = getattr(transport, "bound_port", None) or settings.control_port
+                self_node = NodeManifest(
+                    node_id=ident.node_id,
+                    hostname=settings.advertise_host or ident.node_id,
+                    status="online",
+                    http_url=settings.public_http_url(),
+                    control_host=settings.advertise_host,
+                    control_port=int(bound) if bound else settings.control_port,
+                    devices=[],
+                )
+                store.put_node(self_node)
+                touch = getattr(store, "touch_node", None)
+                if callable(touch):
+                    touch(ident.node_id)
                 _echo(f"[nova] control plane {kind} :{bound}")
             else:
                 try:

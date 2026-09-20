@@ -57,6 +57,7 @@ class TcpTransport(ControlTransport):
         self._server: asyncio.AbstractServer | None = None
         self._peers: dict[str, _Peer] = {}
         self._client_tasks: list[asyncio.Task[None]] = []
+        self._dialed: set[tuple[str, int]] = set()
         self._stopping = False
         self._started = False
 
@@ -82,10 +83,14 @@ class TcpTransport(ControlTransport):
             self._spawn_client(host, port)
 
     def _spawn_client(self, host: str, port: int) -> None:
-        key = (host, int(port))
+        key = (str(host), int(port))
         if key not in self.connect_addrs:
             self.connect_addrs.append(key)
-        self._client_tasks.append(asyncio.create_task(self._client_loop(host, int(port))))
+        if key in self._dialed:
+            return
+        self._dialed.add(key)
+        if self._started:
+            self._client_tasks.append(asyncio.create_task(self._client_loop(host, int(port))))
 
     def add_connect(self, host: str, port: int) -> None:
         """Dial a forwarded worker TCP. Safe to call after start()."""
