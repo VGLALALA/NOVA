@@ -136,6 +136,27 @@ async def test_accepted_put_sends_complete_with_node_id(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_oom_sends_failed_so_tile_can_requeue(tmp_path) -> None:
+    class OomKernel(DummyKernel):
+        def execute_sync(self, task, device):
+            raise RuntimeError("accelerator out of memory on this node; tile will requeue")
+
+    http = FakeHttp(FakeResponse(200, {"status": "accepted"}))
+    worker, transport = _worker(tmp_path, http)
+    worker.kernel = OomKernel()
+    await worker.handle_message("coord", _offer())
+    assert worker._compute_task is not None
+    await worker._compute_task
+    assert http.calls == []
+    assert TASK_FAILED in _types(transport)
+    assert TASK_COMPLETE not in _types(transport)
+    assert worker.slots_used == 0
+    failed = next(env for _peer, env in transport.sent if env.type == TASK_FAILED)
+    assert "out of memory" in failed.payload["error"]
+    assert failed.payload["lease_gen"] == 3
+
+
+@pytest.mark.asyncio
 async def test_missing_upload_url_sends_failed_not_complete(tmp_path) -> None:
     http = FakeHttp(FakeResponse(200, {"status": "accepted"}))
     worker, transport = _worker(tmp_path, http)

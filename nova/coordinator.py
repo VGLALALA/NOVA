@@ -17,6 +17,7 @@ from nova.protocol import (
     HELLO,
     JOB_ANNOUNCE,
     NODE_DISCONNECTED,
+    NODE_PING,
     NODE_GOODBYE,
     NODE_MANIFEST,
     NODE_OFFLINE,
@@ -108,6 +109,68 @@ class Coordinator:
 
     def on_peer_connect(self, peer_id: str) -> None:
         self.bus.emit("PEER_CONNECTED", peer_id=peer_id)
+
+    def _parse_tcp_target(self, raw: str, port: int | None = None) -> tuple[str, int]:
+        text = (raw or "").strip()
+        if not text:
+            raise ValueError("host required")
+        if port is not None:
+            if text.count(":") == 1 and "/" not in text:
+                host, _, maybe = text.partition(":")
+                if maybe.isdigit():
+                    return host.strip(), int(maybe)
+            return text.split(":")[0].strip(), int(port)
+        if "://" in text:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(text if "://" in text else f"tcp://{text}")
+            host = parsed.hostname or text
+            p = parsed.port
+            if p is None:
+                raise ValueError("port required")
+            return host, int(p)
+        if text.count(":") == 1:
+            host, _, p = text.partition(":")
+            return host.strip(), int(p)
+        raise ValueError("expected host:port")
+
+    async def connect_tcp(self, host: str, port: int | None = None) -> dict[str, Any]:
+        """Dial a forwarded worker control socket (ngrok tcp / ssh -R)."""
+        h, p = self._parse_tcp_target(host, port)
+        add = getattr(self.transport, "add_connect", None)
+        if not callable(add):
+            raise RuntimeError("control plane cannot dial TCP")
+        add(h, p)
+        self.bus.emit("NODE_TCP_ADDED", host=h, port=p)
+        return {"host": h, "port": p, "status": "dialing"}
+
+    async def drop_node(self, node_id: str) -> bool:
+        peer = self._node_to_peer.get(node_id) or node_id
+        dropped = False
+        fn = getattr(self.transport, "drop_peer", None)
+        if callable(fn):
+            dropped = bool(await fn(peer))
+        self._handle_disconnect(peer, node_id)
+        deleter = getattr(self.store, "delete_node", None)
+        if callable(deleter):
+            deleter(node_id)
+        self.bus.emit("NODE_REMOVED", node_id=node_id)
+        return dropped
+
+    def list_links(self) -> list[dict[str, Any]]:
+        addrs = getattr(self.transport, "connect_addrs", None)
+        out: list[dict[str, Any]] = []
+        if isinstance(addrs, list):
+            for item in addrs:
+                if isinstance(item, (tuple, list)) and len(item) == 2:
+                    out.append({"host": item[0], "port": int(item[1])})
+        for child in getattr(self.transport, "_transports", []) or []:
+            for item in getattr(child, "connect_addrs", []) or []:
+                if isinstance(item, (tuple, list)) and len(item) == 2:
+                    rec = {"host": item[0], "port": int(item[1])}
+                    if rec not in out:
+                        out.append(rec)
+        return out
 
     def on_peer_disconnect(self, peer_id: str) -> None:
         """Immediate requeue. Do not wait for the 30s heartbeat offline path."""
@@ -234,7 +297,37 @@ class Coordinator:
         )
 
     def _on_heartbeat(self, peer_id: str, node_id: str, env: Envelope) -> None:
+        self._map_peer(peer_id, node_id)
         self.scheduler.on_heartbeat(node_id)
+
+    async def ping_workers(self, timeout_s: float = 1.5) -> list[str]:
+        """Broadcast NODE_PING; mark silent nodes offline. Returns live node ids."""
+        from nova.clock import now_utc
+
+        nodes = list(self.store.list_nodes())
+        before = {
+            n.node_id: self.store.get_last_seen(n.node_id) if hasattr(self.store, "get_last_seen") else None
+            for n in nodes
+        }
+        pinged_at = now_utc()
+        try:
+            await self.transport.broadcast(msg(NODE_PING, self.node_id, ts=pinged_at.isoformat()))
+        except Exception:
+            log.exception("NODE_PING broadcast failed")
+        await asyncio.sleep(max(timeout_s, 0.2))
+        live: list[str] = []
+        for node in self.store.list_nodes():
+            seen = self.store.get_last_seen(node.node_id) if hasattr(self.store, "get_last_seen") else None
+            prev = before.get(node.node_id)
+            if seen is not None and (prev is None or seen > prev or seen >= pinged_at):
+                if node.status != "online":
+                    node.status = "online"
+                    self.store.put_node(node)
+                live.append(node.node_id)
+                continue
+            if node.status != "offline":
+                self.scheduler.on_disconnect(node.node_id)
+        return live
 
     async def _on_work_request(self, peer_id: str, node_id: str, env: Envelope) -> None:
         node = self.store.get_node(node_id)

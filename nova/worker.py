@@ -21,6 +21,7 @@ from nova.protocol import (
     HEARTBEAT,
     NODE_GOODBYE,
     NODE_MANIFEST,
+    NODE_PING,
     PROTOCOL_VERSION,
     TASK_ACCEPT,
     TASK_COMPLETE,
@@ -82,7 +83,10 @@ class Worker:
 
     async def start(self) -> None:
         if self._http is None:
-            self._http = httpx.AsyncClient(timeout=60.0)
+            self._http = httpx.AsyncClient(
+                timeout=60.0,
+                headers={"ngrok-skip-browser-warning": "1"},
+            )
         await self.transport.start()
         await self._warmup()
         await self._hello_and_manifest()
@@ -116,6 +120,12 @@ class Worker:
         if env.type == TASK_OFFER:
             self.coordinator_id = peer_id
             await self._on_offer(peer_id, env.payload)
+        elif env.type == NODE_PING:
+            self.coordinator_id = peer_id
+            await self.transport.send(
+                peer_id,
+                msg(HEARTBEAT, self.node_id, node_id=self.node_id, ping=True),
+            )
         elif env.type == "JOB_ANNOUNCE":
             self.coordinator_id = peer_id
             url = env.payload.get("coordinator_url") or env.payload.get("http_url")
@@ -147,8 +157,27 @@ class Worker:
         device = self._select_device()
         result = await asyncio.to_thread(self.kernel.warmup, device)
         latency_ms = max(int(result.execution_ms), 1)
+        from nova.flops import fp16_tflops
+
         self.manifest.benchmark_scores[self.kernel.kernel_id] = 1000.0 / latency_ms
-        logger.info("warmup %sms on %s score=%.3f", latency_ms, device.backend, 1000.0 / latency_ms)
+        self.manifest.warmup_ms = float(latency_ms)
+        peak = None
+        try:
+            from nova.flops import measure_device_fp16_tflops
+
+            peak = await asyncio.to_thread(measure_device_fp16_tflops, device.device_id)
+        except Exception:
+            peak = None
+        if peak is None:
+            peak = fp16_tflops(latency_ms, steps=1, width=512, height=512)
+        self.manifest.fp16_tflops = round(float(peak), 3)
+        logger.info(
+            "warmup %sms on %s score=%.3f fp16_tflops=%.2f",
+            latency_ms,
+            device.backend,
+            1000.0 / latency_ms,
+            self.manifest.fp16_tflops,
+        )
 
     async def _hello_and_manifest(self, peer_id: str | None = None) -> None:
         hello = msg(HELLO, self.node_id, protocol_version=PROTOCOL_VERSION, node_id=self.node_id)

@@ -103,6 +103,73 @@ def _disable_safety_checker(pipe: Any) -> None:
         pipe.safety_checker = None
     if hasattr(pipe, "requires_safety_checker"):
         pipe.requires_safety_checker = False
+    extractor = getattr(pipe, "feature_extractor", None)
+    if extractor is not None:
+        try:
+            pipe.feature_extractor = None
+        except Exception:
+            pass
+
+
+def _call_pipe_hook(pipe: Any, name: str) -> bool:
+    hook = getattr(pipe, name, None)
+    if not callable(hook):
+        return False
+    try:
+        hook()
+        return True
+    except Exception:
+        return False
+
+
+def _bound_pipeline_memory(pipe: Any, backend: str) -> None:
+    """Cap peak activation memory. Do not CPU-offload — that tanks demo speed."""
+    _call_pipe_hook(pipe, "enable_vae_slicing")
+    if backend == "metal":
+        _call_pipe_hook(pipe, "enable_attention_slicing")
+        _call_pipe_hook(pipe, "enable_vae_tiling")
+
+
+def _is_oom(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "outofmemory" in name.replace("_", ""):
+        return True
+    return "out of memory" in text or "mps backend out of memory" in text
+
+
+def _synchronize(torch: Any, torch_device: Any) -> None:
+    if torch is None or torch_device is None:
+        return
+    kind = getattr(torch_device, "type", None)
+    if kind == "cuda":
+        sync = getattr(getattr(torch, "cuda", None), "synchronize", None)
+    elif kind == "mps":
+        sync = getattr(getattr(torch, "mps", None), "synchronize", None)
+    else:
+        return
+    if callable(sync):
+        try:
+            sync()
+        except Exception:
+            pass
+
+
+def _release_accelerator(torch: Any, torch_device: Any) -> None:
+    """Return unused MPS blocks to the driver. CUDA keeps its cache for speed."""
+    if torch is None or torch_device is None:
+        return
+    if getattr(torch_device, "type", None) != "mps":
+        return
+    import gc
+
+    gc.collect()
+    empty = getattr(getattr(torch, "mps", None), "empty_cache", None)
+    if callable(empty):
+        try:
+            empty()
+        except Exception:
+            pass
 
 
 def _tune_nvidia(torch: Any, pipe: Any) -> None:
@@ -221,10 +288,8 @@ class SDText2ImageKernel(NovaKernel):
 
         pipe = pipe.to(torch_dev)
         _disable_safety_checker(pipe)
-        if device.backend == "metal":
-            if hasattr(pipe, "enable_attention_slicing"):
-                pipe.enable_attention_slicing()
-        elif device.backend in {"cuda", "rocm"}:
+        _bound_pipeline_memory(pipe, device.backend)
+        if device.backend in {"cuda", "rocm"}:
             _tune_nvidia(torch, pipe)
         if hasattr(pipe, "set_progress_bar_config"):
             pipe.set_progress_bar_config(disable=True)
@@ -248,29 +313,43 @@ class SDText2ImageKernel(NovaKernel):
 
         infer = getattr(torch, "inference_mode", None)
         ctx = infer() if callable(infer) else nullcontext()
-        with ctx:
-            out = self._pipe(
-                prompt=task.prompt,
-                num_inference_steps=int(task.steps or 4),
-                guidance_scale=guidance,
-                width=int(task.width or 512),
-                height=int(task.height or 512),
-                generator=generator,
+        out = None
+        image = None
+        try:
+            with ctx:
+                out = self._pipe(
+                    prompt=task.prompt,
+                    num_inference_steps=int(task.steps or 4),
+                    guidance_scale=guidance,
+                    width=int(task.width or 512),
+                    height=int(task.height or 512),
+                    generator=generator,
+                    output_type="pil",
+                )
+            _synchronize(torch, self._torch_device)
+            image = out.images[0]
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            png = buf.getvalue()
+            execution_ms = max(int((time.perf_counter() - t0) * 1000), 0)
+            return KernelResult(
+                png_bytes=png,
+                sha256=hashlib.sha256(png).hexdigest(),
+                execution_ms=execution_ms,
+                device_id=device.device_id,
+                backend=device.backend,
             )
-        if self._torch_device is not None and getattr(self._torch_device, "type", None) == "cuda":
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-        image = out.images[0]
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        png = buf.getvalue()
-        execution_ms = max(int((time.perf_counter() - t0) * 1000), 0)
-        return KernelResult(
-            png_bytes=png,
-            sha256=hashlib.sha256(png).hexdigest(),
-            execution_ms=execution_ms,
-            device_id=device.device_id,
-            backend=device.backend,
-        )
+        except Exception as exc:
+            if _is_oom(exc):
+                raise RuntimeError(
+                    "accelerator out of memory on this node; tile will requeue"
+                ) from exc
+            raise
+        finally:
+            if out is not None:
+                images = getattr(out, "images", None)
+                if isinstance(images, list):
+                    images.clear()
+            del out
+            del image
+            _release_accelerator(torch, self._torch_device)

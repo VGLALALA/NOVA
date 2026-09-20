@@ -79,11 +79,28 @@ class FallbackStore:
         self.jobs: dict[str, Any] = {}
         self.tasks: dict[str, Any] = {}
         self.nodes: dict[str, Any] = {}
+        self._last_seen: dict[str, Any] = {}
         self.tiles_dir = Path(data_dir) / "tiles"
         self.tiles_dir.mkdir(parents=True, exist_ok=True)
 
     def get_job(self, job_id: str) -> Any | None:
         return self.jobs.get(job_id)
+
+    def put_job(self, job: Any) -> Any:
+        self.jobs[job.job_id] = job
+        return job
+
+    def put_task(self, task: Any) -> Any:
+        self.tasks[task.task_id] = task
+        return task
+
+    def get_node(self, node_id: str) -> Any | None:
+        return self.nodes.get(node_id)
+
+    def delete_node(self, node_id: str) -> bool:
+        gone = self.nodes.pop(node_id, None) is not None
+        self._last_seen.pop(node_id, None)
+        return gone
 
     def list_jobs(self) -> list[Any]:
         return list(self.jobs.values())
@@ -102,6 +119,14 @@ class FallbackStore:
 
     def put_node(self, node: NodeManifest) -> None:
         self.nodes[node.node_id] = node
+
+    def touch_node(self, node_id: str, when: Any | None = None) -> None:
+        from nova.clock import now_utc
+
+        self._last_seen[node_id] = when or now_utc()
+
+    def get_last_seen(self, node_id: str) -> Any | None:
+        return self._last_seen.get(node_id)
 
     def submit_job(self, job: Any, tasks: list[Any]) -> Any:
         stale = [tid for tid, t in self.tasks.items() if t.job_id == job.job_id]
@@ -190,6 +215,7 @@ def _inject_sim_nodes(store: Any, count: int) -> None:
                 )
             ],
             benchmark_scores={"sd.t2i.v1": round(12.0 - idx * 3.5 - i * 0.1, 2)},
+            warmup_ms=round(1000.0 / max(round(12.0 - idx * 3.5 - i * 0.1, 2), 0.1), 1),
             status="online",
         )
         upsert = getattr(store, "upsert_node", None) or getattr(store, "put_node", None)
@@ -262,6 +288,50 @@ def _make_tcp(
         connect_addrs=list(connect_addrs),
         node_id=node_id,
     )
+
+
+def _make_pear(*, node_id: str, settings: Settings) -> Any | None:
+    """Hyperswarm sidecar when node + hyperswarm are installed. Optional."""
+    pear_cls = _optional("nova.network.pear", "PearTransport")
+    if pear_cls is None:
+        return None
+    available = getattr(pear_cls, "available", None)
+    if callable(available) and not available():
+        return None
+    return pear_cls(node_id=node_id, swarm_topic=settings.swarm_topic)
+
+
+def _make_control(
+    *,
+    node_id: str,
+    listen: bool,
+    connect_addrs: list[tuple[str, int]],
+    settings: Settings,
+    include_pear: bool = True,
+) -> tuple[Any | None, str]:
+    """Pear discovery + TCP emergency path as one ControlTransport.
+
+    Local in-process workers should pass include_pear=False so they stay on
+    loopback TCP and do not spawn a second Hyperswarm sidecar.
+    """
+    tcp = _make_tcp(
+        node_id=node_id,
+        listen=listen,
+        connect_addrs=connect_addrs,
+        settings=settings,
+    )
+    pear = _make_pear(node_id=node_id, settings=settings) if include_pear else None
+    parts: list[Any] = [t for t in (tcp, pear) if t is not None]
+    if not parts:
+        return None, "none"
+    if tcp is not None and pear is not None:
+        hub_cls = _optional("nova.network.hub", "Hub")
+        if hub_cls is not None:
+            return hub_cls(parts), "pear+tcp"
+        return tcp, "tcp"
+    if pear is not None:
+        return pear, "pear"
+    return tcp, "tcp"
 
 
 def _make_worker(
@@ -374,25 +444,28 @@ def start(
         url = settings.coordinator_url or settings.public_http_url()
         _echo(f"[nova] coordinator {url}")
         addrs = _worker_connect_addrs(settings)
-        if not addrs:
-            _echo(
-                "Worker needs NOVA_COORDINATOR_URL or NOVA_PEERS=host:7946 "
-                "to reach the coordinator.",
-                err=True,
-            )
-            raise typer.Exit(1)
         if _optional("nova.worker", "Worker") is None:
             _echo("Cannot start worker: nova.worker.Worker is not available yet.", err=True)
             raise typer.Exit(1)
-        transport = _make_tcp(
+        transport, kind = _make_control(
             node_id=ident.node_id,
             listen=False,
             connect_addrs=addrs,
             settings=settings,
+            include_pear=True,
         )
-        if transport is None:
-            _echo("Cannot start worker: nova.network.tcp.TcpTransport is not available yet.", err=True)
+        pear_ok = kind in {"pear", "pear+tcp"}
+        if transport is None or kind == "none" or (not pear_ok and not addrs):
+            _echo(
+                "Worker needs Pear (cd pear && npm install) or "
+                "NOVA_COORDINATOR_URL / NOVA_PEERS=host:7946.",
+                err=True,
+            )
             raise typer.Exit(1)
+        if pear_ok and not addrs and not settings.coordinator_url:
+            _echo(f"[nova] control     {kind} (set NOVA_COORDINATOR_URL if PNG PUT fails)")
+        else:
+            _echo(f"[nova] control     {kind}")
 
         async def _run_worker() -> None:
             inst = _make_worker(settings=settings, transport=transport, identity=ident, clock=clock)
@@ -454,26 +527,27 @@ def start(
                 _echo(f"[nova] --simulate-workers {simulate_workers} (display cards only)")
                 _inject_sim_nodes(store, simulate_workers)
                 bus.emit("SYSTEM", message=f"simulated {simulate_workers} workers")
-            transport = _make_tcp(
+            transport, kind = _make_control(
                 node_id=ident.node_id,
                 listen=True,
                 connect_addrs=[],
                 settings=settings,
+                include_pear=True,
             )
             if transport is None:
-                _echo("[nova] nova.network.tcp.TcpTransport not ready — HTTP only")
+                _echo("[nova] control plane not ready — HTTP only")
             elif coord_cls is not None:
                 coordinator = coord_cls(store, scheduler, transport, bus, settings, clock, ident)
                 await coordinator.start()
                 fa_app.state.coordinator = coordinator
                 bound = getattr(transport, "bound_port", None) or settings.control_port
-                _echo(f"[nova] TCP control plane up :{bound}")
+                _echo(f"[nova] control plane {kind} :{bound}")
             else:
                 try:
                     await transport.start()
-                    _echo("[nova] TCP control plane up")
+                    _echo(f"[nova] control plane {kind}")
                 except Exception as exc:
-                    _echo(f"[nova] TCP control plane failed: {exc}", err=True)
+                    _echo(f"[nova] control plane failed: {exc}", err=True)
 
         config = uvicorn.Config(
             fa_app,
@@ -499,11 +573,12 @@ def start(
             ):
                 control_port = getattr(transport, "bound_port", None) or settings.control_port
                 worker_ident = load_or_create(settings.data_dir / "local-worker")
-                worker_transport = _make_tcp(
+                worker_transport, worker_kind = _make_control(
                     node_id=worker_ident.node_id,
                     listen=False,
                     connect_addrs=[("127.0.0.1", int(control_port))],
                     settings=settings,
+                    include_pear=False,
                 )
                 if worker_transport is None:
                     _echo("[nova] local worker skipped — TcpTransport missing")
@@ -516,7 +591,7 @@ def start(
                             clock=clock,
                         )
                         asyncio.create_task(local_worker.run(), name="nova-local-worker")
-                        _echo(f"[nova] local worker {worker_ident.node_id}")
+                        _echo(f"[nova] local worker {worker_ident.node_id} ({worker_kind})")
                     except Exception as exc:
                         _echo(f"[nova] local worker failed to start: {exc}", err=True)
                         local_worker = None

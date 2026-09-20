@@ -70,8 +70,13 @@ def _job_id_of(job: Any) -> str:
     return str(getattr(job, "job_id", ""))
 
 
-def split_gallery_doc(doc: dict[str, Any], *, job_id: str | None = None) -> tuple[Job, list[Task]]:
-    """Turn demo/gallery.yaml (or equivalent dict) into a Job + 24 tasks."""
+def split_gallery_doc(
+    doc: dict[str, Any],
+    *,
+    job_id: str | None = None,
+    count: int | None = None,
+) -> tuple[Job, list[Task]]:
+    """Turn demo/gallery.yaml (or equivalent dict) into a Job + N tasks."""
     spec = doc.get("job") or {}
     model = doc.get("model") or {}
     req_raw = doc.get("requirements") or {}
@@ -95,9 +100,15 @@ def split_gallery_doc(doc: dict[str, Any], *, job_id: str | None = None) -> tupl
         kernel_id=str(spec.get("kernel") or KERNEL_SD_T2I),
         created_at=created,
         state="QUEUED",
+        scheduler_policy=str(spec.get("scheduler_policy") or "adaptive_pull"),
         requirements=req,
         prompts=[PromptSpec(text=str(p["text"]), seed=int(p["seed"])) for p in prompts_raw],
+        quotas={str(k): int(v) for k, v in dict(spec.get("quotas") or {}).items()},
     )
+    if count is not None:
+        from nova.jobs import take_prompts
+
+        job.prompts = take_prompts(job.prompts, count)
     tasks: list[Task] = []
     for i, prompt in enumerate(job.prompts):
         tasks.append(
@@ -117,14 +128,18 @@ def split_gallery_doc(doc: dict[str, Any], *, job_id: str | None = None) -> tupl
                 created_at=created,
             )
         )
+    from nova.jobs import apply_quotas
+
+    apply_quotas(job, tasks)
     return job, tasks
 
 
-def split_gallery_path(path: Path) -> tuple[Job, list[Task]]:
+def split_gallery_path(path: Path, *, count: int | None = None) -> tuple[Job, list[Task]]:
     try:
-        from nova.jobs import split_gallery as _split  # type: ignore
+        from nova.jobs import load_and_split as _split  # type: ignore
+        from nova.clock import Clock
 
-        result = _split(path)
+        result = _split(path, Clock(), count=count)
         if isinstance(result, tuple) and len(result) == 2:
             return result  # type: ignore[return-value]
     except (ImportError, AttributeError, TypeError):
@@ -132,7 +147,19 @@ def split_gallery_path(path: Path) -> tuple[Job, list[Task]]:
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(doc, dict):
         raise ValueError(f"invalid gallery yaml: {path}")
-    return split_gallery_doc(doc)
+    return split_gallery_doc(doc, count=count)
+
+
+def _parse_count(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="count must be an integer") from exc
+    if n < 1 or n > 96:
+        raise HTTPException(status_code=400, detail="count must be between 1 and 96")
+    return n
 
 
 def _get_task(store: Any, task_id: str) -> Task | None:
@@ -288,6 +315,38 @@ def _job_payload(store: Any, job: Any) -> dict[str, Any]:
     data["failed"] = sum(1 for s in states if s == "FAILED")
     data["total"] = len(tasks)
     data["contribution"] = _contribution(tasks)
+    started = data.get("started_at") or data.get("created_at")
+    finished = data.get("finished_at")
+    if data.get("state") == "COMPLETED" and not finished:
+        times = [_as_dict(t).get("completed_at") for t in tasks]
+        times = [t for t in times if t]
+        finished = max(times) if times else None
+        data["finished_at"] = finished
+    elapsed_ms = None
+    try:
+        from datetime import datetime
+
+        def _parse(ts: Any) -> datetime | None:
+            if ts is None:
+                return None
+            if isinstance(ts, datetime):
+                return ts
+            text = str(ts).replace("Z", "+00:00")
+            return datetime.fromisoformat(text)
+
+        t0 = _parse(started)
+        t1 = _parse(finished) if finished else now_utc()
+        if t0 is not None and t1 is not None:
+            elapsed_ms = max(int((t1 - t0).total_seconds() * 1000), 0)
+    except Exception:
+        elapsed_ms = None
+    data["elapsed_ms"] = elapsed_ms
+    infer_ms = 0
+    for t in tasks:
+        ms = _as_dict(t).get("execution_ms")
+        if isinstance(ms, (int, float)):
+            infer_ms += int(ms)
+    data["inference_ms"] = infer_ms or None
     return data
 
 
@@ -295,7 +354,37 @@ def _task_payload(task: Any) -> dict[str, Any]:
     return _as_dict(task)
 
 
-def _node_payload(node: Any) -> dict[str, Any]:
+def _age_s(store: Any, node_id: str) -> float | None:
+    getter = getattr(store, "get_last_seen", None)
+    if not callable(getter):
+        return None
+    seen = getter(node_id)
+    if seen is None:
+        return None
+    try:
+        return max((now_utc() - seen).total_seconds(), 0.0)
+    except Exception:
+        return None
+
+
+def _live_status(store: Any, node: Any, settings: Settings | None = None) -> tuple[str, float | None]:
+    data = _as_dict(node)
+    stored = str(data.get("status") or "offline")
+    if stored == "offline":
+        return "offline", _age_s(store, str(data.get("node_id") or ""))
+    age = _age_s(store, str(data.get("node_id") or ""))
+    suspect_s = float(getattr(settings, "suspect_s", 15.0) if settings else 15.0)
+    offline_s = float(getattr(settings, "offline_s", 30.0) if settings else 30.0)
+    if age is None:
+        return "offline", None
+    if age >= offline_s:
+        return "offline", age
+    if age >= suspect_s:
+        return "suspect", age
+    return "online", age
+
+
+def _node_payload(node: Any, store: Any | None = None, settings: Settings | None = None) -> dict[str, Any]:
     data = _as_dict(node)
     devices = data.get("devices") or []
     primary = devices[0] if devices else {}
@@ -304,15 +393,33 @@ def _node_payload(node: Any) -> dict[str, Any]:
     data["primary_vendor"] = primary.get("vendor")
     scores = data.get("benchmark_scores") or {}
     data["score"] = scores.get(KERNEL_SD_T2I, scores.get("sd.t2i.v1"))
-    status = data.get("status") or "offline"
+    if data.get("fp16_tflops") is None and data.get("warmup_ms"):
+        from nova.flops import fp16_tflops
+
+        data["fp16_tflops"] = round(fp16_tflops(float(data["warmup_ms"])), 3)
+    elif data.get("fp16_tflops") is None and data.get("score"):
+        try:
+            latency = 1000.0 / float(data["score"])
+            from nova.flops import fp16_tflops
+
+            data["fp16_tflops"] = round(fp16_tflops(latency), 3)
+            data["warmup_ms"] = round(latency, 1)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    live, age = _live_status(store, node, settings) if store is not None else (
+        str(data.get("status") or "offline"),
+        None,
+    )
+    data["status"] = live
+    data["last_seen_s"] = None if age is None else round(age, 1)
     data["display_status"] = {"online": "ACTIVE", "suspect": "SUSPECT", "offline": "LOST"}.get(
-        status, status.upper()
+        live, live.upper()
     )
     return data
 
 
 def _system_payload(store: Any, settings: Settings) -> dict[str, Any]:
-    nodes = [_node_payload(n) for n in _list_nodes(store)]
+    nodes = [_node_payload(n, store, settings) for n in _list_nodes(store)]
     backends: list[str] = []
     seen: set[str] = set()
     accel_mb = 0
@@ -350,10 +457,13 @@ def _maybe_finish_job(store: Any, bus: EventBus, job_id: str) -> None:
     if job is None:
         return
     if all(s == "COMPLETED" for s in states):
+        done = now_utc()
         if isinstance(job, dict):
             job["state"] = "COMPLETED"
+            job["finished_at"] = done
         else:
             job.state = "COMPLETED"
+            job.finished_at = done
         upsert = (
             getattr(store, "put_job", None)
             or getattr(store, "upsert_job", None)
@@ -477,6 +587,8 @@ def _invoke_accept_result(
 def _parse_job_body(body: dict[str, Any], *, cwd: Path) -> tuple[Job, list[Task]]:
     requested_id = body.get("job_id")
     requested_id = str(requested_id) if requested_id else None
+    count_raw = body.get("count", body.get("batch", body.get("n")))
+    count = _parse_count(count_raw) if "count" in body or "batch" in body or "n" in body else None
     path_raw = body.get("path") or body.get("yaml_path")
     yaml_text = body.get("yaml")
     if path_raw:
@@ -486,27 +598,28 @@ def _parse_job_body(body: dict[str, Any], *, cwd: Path) -> tuple[Job, list[Task]
         if not path.is_file():
             raise HTTPException(status_code=400, detail=f"yaml not found: {path}")
         try:
-            job, tasks = split_gallery_path(path)
+            job, tasks = split_gallery_path(path, count=count)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"invalid gallery yaml: {exc}") from exc
         if requested_id and job.job_id != requested_id:
             return split_gallery_doc(
                 yaml.safe_load(path.read_text(encoding="utf-8")),
                 job_id=requested_id,
+                count=count,
             )
         return job, tasks
     if isinstance(yaml_text, str):
         doc = yaml.safe_load(yaml_text)
         if not isinstance(doc, dict):
             raise HTTPException(status_code=400, detail="yaml must be a mapping")
-        return split_gallery_doc(doc, job_id=requested_id)
+        return split_gallery_doc(doc, job_id=requested_id, count=count)
     if "prompts" in body:
-        return split_gallery_doc(body, job_id=requested_id)
+        return split_gallery_doc(body, job_id=requested_id, count=count)
     nested = body.get("job")
     if isinstance(nested, dict) and ("prompts" in nested or "name" in nested):
         # inline {job, model, requirements, prompts} sometimes nests prompts at top
         if "prompts" in body or "model" in body:
-            return split_gallery_doc(body, job_id=requested_id)
+            return split_gallery_doc(body, job_id=requested_id, count=count)
     raise HTTPException(
         status_code=400,
         detail="provide {path}, {yaml}, or a gallery document with prompts",
@@ -554,7 +667,89 @@ def create_app(
 
     @app.get("/nodes")
     def nodes() -> list[dict[str, Any]]:
-        return [_node_payload(n) for n in _list_nodes(store)]
+        return [_node_payload(n, store, settings) for n in _list_nodes(store)]
+
+    def _tcp_target(body: dict[str, Any]) -> tuple[str, int | None]:
+        host = body.get("host") or body.get("address") or body.get("tcp") or body.get("url")
+        port = body.get("port")
+        if host is None:
+            raise HTTPException(status_code=400, detail="host or host:port required")
+        if port is not None:
+            try:
+                port = int(port)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="port must be an integer") from exc
+        return str(host), port
+
+    @app.get("/nodes/links")
+    def node_links() -> dict[str, Any]:
+        coordinator = getattr(app.state, "coordinator", None)
+        links = []
+        if coordinator is not None and hasattr(coordinator, "list_links"):
+            links = coordinator.list_links()
+        return {"links": links}
+
+    @app.post("/nodes/tcp")
+    async def add_tcp_node(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="JSON body required") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON object required")
+        host, port = _tcp_target(body)
+        coordinator = getattr(app.state, "coordinator", None)
+        if coordinator is None or not hasattr(coordinator, "connect_tcp"):
+            raise HTTPException(status_code=503, detail="coordinator not attached")
+        try:
+            result = await coordinator.connect_tcp(host, port)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return JSONResponse(result, status_code=202)
+
+    def _forget_node(node_id: str) -> None:
+        off = getattr(scheduler, "on_disconnect", None)
+        if callable(off):
+            off(node_id)
+        deleter = getattr(store, "delete_node", None)
+        if callable(deleter):
+            deleter(node_id)
+        else:
+            nodes = getattr(store, "nodes", None)
+            if isinstance(nodes, dict):
+                nodes.pop(node_id, None)
+            seen = getattr(store, "_last_seen", None)
+            if isinstance(seen, dict):
+                seen.pop(node_id, None)
+
+    @app.post("/nodes/{node_id}/remove")
+    async def post_remove_node(node_id: str) -> dict[str, Any]:
+        return await remove_node(node_id)
+
+    @app.delete("/nodes/{node_id}")
+    async def remove_node(node_id: str) -> dict[str, Any]:
+        coordinator = getattr(app.state, "coordinator", None)
+        if coordinator is not None and hasattr(coordinator, "drop_node"):
+            await coordinator.drop_node(node_id)
+        else:
+            _forget_node(node_id)
+        bus.emit("NODE_REMOVED", node_id=node_id)
+        return {"node_id": node_id, "removed": True}
+
+    @app.post("/nodes/ping")
+    async def ping_nodes() -> dict[str, Any]:
+        coordinator = getattr(app.state, "coordinator", None)
+        live: list[str] = []
+        if coordinator is not None:
+            ping = getattr(coordinator, "ping_workers", None)
+            if callable(ping):
+                result = ping()
+                if inspect.isawaitable(result):
+                    result = await result
+                live = list(result or [])
+        return {"live": live, "count": len(live)}
 
     @app.get("/jobs")
     def jobs() -> list[dict[str, Any]]:
@@ -573,6 +768,17 @@ def create_app(
 
     async def _dispatch_job(job: Job, tasks: list[Task]) -> dict[str, Any]:
         coordinator = getattr(app.state, "coordinator", None)
+        if coordinator is not None:
+            ping = getattr(coordinator, "ping_workers", None)
+            if callable(ping):
+                try:
+                    result = ping()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+        if getattr(job, "started_at", None) is None:
+            job.started_at = now_utc()
         submitted = False
         if coordinator is not None:
             fn = getattr(coordinator, "submit_job", None)
@@ -614,10 +820,31 @@ def create_app(
         }
 
     @app.post("/jobs/gallery")
-    async def post_default_gallery() -> JSONResponse:
+    async def post_default_gallery(request: Request) -> JSONResponse:
         if not DEMO_GALLERY.is_file():
             raise HTTPException(status_code=404, detail="demo/gallery.yaml not found")
-        job, tasks = split_gallery_path(DEMO_GALLERY)
+        count = _parse_count(request.query_params.get("count"))
+        policy = None
+        quotas = None
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if isinstance(body, dict):
+                if "count" in body or "batch" in body or "n" in body:
+                    count = _parse_count(body.get("count", body.get("batch", body.get("n"))))
+                spec = body.get("job") if isinstance(body.get("job"), dict) else body
+                policy = spec.get("scheduler_policy")
+                quotas = spec.get("quotas")
+        job, tasks = split_gallery_path(DEMO_GALLERY, count=count)
+        if policy in {"adaptive_pull", "quota"}:
+            job.scheduler_policy = policy
+        if isinstance(quotas, dict):
+            job.quotas = {str(k): int(v) for k, v in quotas.items()}
+            from nova.jobs import apply_quotas
+
+            apply_quotas(job, tasks)
         return JSONResponse(await _dispatch_job(job, tasks), status_code=201)
 
     @app.get("/jobs/{job_id}")

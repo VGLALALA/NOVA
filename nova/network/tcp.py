@@ -79,7 +79,27 @@ class TcpTransport(ControlTransport):
             self.listen_port = self.bound_port
             logger.info("control listening on %s:%s", host, self.bound_port)
         for host, port in self.connect_addrs:
-            self._client_tasks.append(asyncio.create_task(self._client_loop(host, port)))
+            self._spawn_client(host, port)
+
+    def _spawn_client(self, host: str, port: int) -> None:
+        key = (host, int(port))
+        if key not in self.connect_addrs:
+            self.connect_addrs.append(key)
+        self._client_tasks.append(asyncio.create_task(self._client_loop(host, int(port))))
+
+    def add_connect(self, host: str, port: int) -> None:
+        """Dial a forwarded worker TCP. Safe to call after start()."""
+        self._spawn_client(host, int(port))
+
+    async def drop_peer(self, peer_id: str) -> bool:
+        peer = self._peers.get(peer_id)
+        if peer is None:
+            return False
+        await self._teardown(peer)
+        return True
+
+    def peer_ids(self) -> list[str]:
+        return [p.peer_id for p in self._peers.values() if not p.closed]
 
     async def stop(self) -> None:
         self._stopping = True

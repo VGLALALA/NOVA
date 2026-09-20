@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     control_host: str = "0.0.0.0"
     control_port: int = 7946
     coordinator_url: str | None = None
+    public_url: str | None = None  # advertised HTTP base (ngrok / reverse proxy)
     peers: str | None = None  # comma-separated host:port
     data_dir: Path = Path(".nova")
     model_id: str = "stabilityai/sd-turbo"
@@ -47,6 +48,8 @@ class Settings(BaseSettings):
         return out
 
     def public_http_url(self) -> str:
+        if self.public_url:
+            return str(self.public_url).rstrip("/")
         host = self.advertise_host or "127.0.0.1"
         return f"http://{host}:{self.http_port}"
 

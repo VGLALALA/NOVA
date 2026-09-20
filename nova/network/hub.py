@@ -18,6 +18,22 @@ class Hub(ControlTransport):
         self._transports = list(transports)
         self._route: dict[str, ControlTransport] = {}
 
+    @property
+    def bound_port(self) -> int | None:
+        for child in self._transports:
+            port = getattr(child, "bound_port", None)
+            if port is not None:
+                return int(port)
+        return None
+
+    @property
+    def bound_host(self) -> str | None:
+        for child in self._transports:
+            host = getattr(child, "bound_host", None)
+            if host:
+                return str(host)
+        return None
+
     async def start(self) -> None:
         for t in self._transports:
             self._bind(t)
@@ -42,6 +58,22 @@ class Hub(ControlTransport):
     async def broadcast(self, env: Envelope) -> None:
         for child in self._transports:
             await child.broadcast(env)
+
+    def add_connect(self, host: str, port: int) -> None:
+        for child in self._transports:
+            fn = getattr(child, "add_connect", None)
+            if callable(fn):
+                fn(host, int(port))
+                return
+        raise RuntimeError("no TCP transport to dial")
+
+    async def drop_peer(self, peer_id: str) -> bool:
+        for child in self._transports:
+            fn = getattr(child, "drop_peer", None)
+            if callable(fn):
+                if await fn(peer_id):
+                    return True
+        return False
 
     def _bind(self, t: ControlTransport) -> None:
         async def on_msg(peer_id: str, env: Envelope) -> None:

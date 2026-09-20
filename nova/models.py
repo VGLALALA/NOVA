@@ -34,6 +34,8 @@ class NodeManifest(BaseModel):
     devices: list[Device] = Field(default_factory=list)
     supported_kernels: list[str] = Field(default_factory=lambda: [KERNEL_SD_T2I])
     benchmark_scores: dict[str, float] = Field(default_factory=dict)
+    warmup_ms: float | None = None
+    fp16_tflops: float | None = None
     max_concurrency: int = 1
     current_slots_used: int = 0
     status: NodeStatus = "online"
@@ -60,10 +62,13 @@ class Job(BaseModel):
     job_type: str = "sd_gallery"
     kernel_id: str = KERNEL_SD_T2I
     created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     state: JobState = "QUEUED"
-    scheduler_policy: str = "adaptive_pull"
+    scheduler_policy: str = "adaptive_pull"  # adaptive_pull | quota
     requirements: JobRequirements = Field(default_factory=JobRequirements)
     prompts: list[PromptSpec] = Field(default_factory=list)
+    quotas: dict[str, int] = Field(default_factory=dict)
 
 
 class Task(BaseModel):
@@ -93,6 +98,7 @@ class Task(BaseModel):
     device_id_used: str | None = None
     execution_ms: int | None = None
     last_failed_node: str | None = None  # one-cycle blacklist
+    reserved_node: str | None = None  # quota mode: preferred assignee
 
 
 class KernelResult(BaseModel):

@@ -136,6 +136,8 @@ class WorkerProfile:
             ],
             supported_kernels=[KERNEL_SD_T2I],
             benchmark_scores={KERNEL_SD_T2I: self.score},
+            warmup_ms=1000.0 / self.score if self.score else None,
+            fp16_tflops={"cuda": 82.6, "rocm": 61.4, "metal": 10.6}.get(self.backend),
             max_concurrency=1,
             current_slots_used=0,
             status="online",

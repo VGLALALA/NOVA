@@ -18,6 +18,7 @@ def load_gallery(
     *,
     job_id: str | None = None,
     clock: Clock | None = None,
+    count: int | None = None,
 ) -> Job:
     """Load a committed gallery yaml into a Job. Same yaml → same 24 slots."""
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -42,6 +43,8 @@ def load_gallery(
         PromptSpec(text=str(row["text"]), seed=int(row["seed"]))
         for row in prompt_rows
     ]
+    if count is not None:
+        prompts = take_prompts(prompts, count)
     created = clock.now() if clock is not None else now_utc()
     resolved_id = job_id or str(job_block.get("id") or f"{name}-{uuid.uuid4().hex[:8]}")
     return Job(
@@ -54,6 +57,7 @@ def load_gallery(
         scheduler_policy=str(job_block.get("scheduler_policy") or "adaptive_pull"),
         requirements=requirements,
         prompts=prompts,
+        quotas=dict(job_block.get("quotas") or {}),
     )
 
 
@@ -82,7 +86,31 @@ def split_job(job: Job, clock: Clock) -> list[Task]:
                 created_at=now,
             )
         )
+    apply_quotas(job, tasks)
     return tasks
+
+
+def apply_quotas(job: Job, tasks: list[Task]) -> None:
+    """Stamp reserved_node from job.quotas in shard order. Quota mode only."""
+    if (job.scheduler_policy or "adaptive_pull") != "quota":
+        return
+    remaining: list[tuple[str, int]] = []
+    for node_id, n in (job.quotas or {}).items():
+        try:
+            count = int(n)
+        except (TypeError, ValueError):
+            continue
+        if count > 0 and node_id:
+            remaining.append((str(node_id), count))
+    idx = 0
+    for task in tasks:
+        while idx < len(remaining) and remaining[idx][1] <= 0:
+            idx += 1
+        if idx >= len(remaining):
+            break
+        node_id, left = remaining[idx]
+        task.reserved_node = node_id
+        remaining[idx] = (node_id, left - 1)
 
 
 def load_and_split(
@@ -90,6 +118,25 @@ def load_and_split(
     clock: Clock,
     *,
     job_id: str | None = None,
+    count: int | None = None,
 ) -> tuple[Job, list[Task]]:
-    job = load_gallery(path, job_id=job_id, clock=clock)
+    job = load_gallery(path, job_id=job_id, clock=clock, count=count)
     return job, split_job(job, clock)
+
+
+def take_prompts(prompts: list[PromptSpec], count: int) -> list[PromptSpec]:
+    """First N prompts, cycling the list if the UI asks for more than yaml has."""
+    n = int(count)
+    if n < 1:
+        raise ValueError("count must be >= 1")
+    if n > 96:
+        raise ValueError("count must be <= 96")
+    if not prompts:
+        raise ValueError("gallery has no prompts")
+    if n <= len(prompts):
+        return list(prompts[:n])
+    out: list[PromptSpec] = []
+    for i in range(n):
+        src = prompts[i % len(prompts)]
+        out.append(PromptSpec(text=src.text, seed=int(src.seed) + (i // len(prompts)) * 1000))
+    return out

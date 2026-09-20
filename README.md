@@ -62,17 +62,21 @@ At demo time the worker loads **local files only**. Do not hit Hugging Face whil
 
 A Hugging Face snapshot under `models/sd-turbo/` (with `model_index.json`) is preferred. A lone `sd_turbo.safetensors` in that directory, or `NOVA_MODEL_DIR` pointing at the file, also works — the kernel uses `from_single_file` for that path.
 
+Jobs are already sharded: 24 independent 512×512 tiles, one lease per free slot. A Mac still generates on Metal (fp16, VAE slice/tile, attention slicing, MPS cache released after each tile). If a node OOMs, that tile fails closed and another worker pulls it — the Mac does not have to finish the gallery alone. Tight unified memory: run `nova dashboard` on the Mac and `nova worker` on the GPU boxes.
+
 ```bash
 # submitter / projector — job dashboard service (HTTP + scheduler, no local GPU)
 nova dashboard
 
 # GPU machines — worker service
+# Pear discovers the coordinator on the shared NOVA_SWARM_TOPIC.
+# Typed-IP fallback if Hyperswarm fails:
 NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova worker
 # equivalent:
 # NOVA_ROLE=worker NOVA_COORDINATOR_URL=http://192.168.x.x:8080 nova start --worker
 ```
 
-On the dashboard, click **Send 24-tile job**. `nova run demo/gallery.yaml` still works from a terminal.
+On the dashboard: **Gallery** tab to dispatch, **Benchmark** tab for per-node FP16 TFLOPS (from warmup). Set **tiles**, then **finish ASAP** (adaptive pull) or **assign per node** (quota). Click **Send gallery**. `nova run demo/gallery.yaml` still works from a terminal.
 
 `nova start` remains the one-process demo (dashboard + local worker). `nova dashboard` / `nova worker` are the two long-running services.
 
@@ -102,7 +106,7 @@ Units live under `packaging/`. LAN-only HTTP, no auth — do not port-forward `:
 |---|---|
 | `nova dashboard` | Job dashboard service: HTTP API + live gallery, no local worker |
 | `nova worker` | Worker service: pull tiles, PUT PNG results |
-| `nova start` | Coordinator HTTP + TCP control, plus a local worker |
+| `nova start` | Coordinator HTTP + Pear/TCP control, plus a local worker |
 | `nova start --dashboard` | Same as `nova dashboard` |
 | `nova start --worker` | Same as `nova worker` (also `NOVA_ROLE=worker`) |
 | `nova start --dummy` | Dummy kernel, no torch |

@@ -124,6 +124,16 @@ def test_disconnect_requeues_immediately(clock: FakeClock, tmp_path: Path) -> No
     assert nxt.lease_gen == gen + 1
 
 
+def test_never_seen_node_is_offline(clock: FakeClock, tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    sched = Scheduler(store, clock=clock)
+    store.put_node(_cuda_node("ghost"))
+    offlined = sched.check_node_liveness()
+    assert "ghost" in offlined
+    node = store.get_node("ghost")
+    assert node is not None and node.status == "offline"
+
+
 def test_split_gallery_yaml_24_tasks(clock: FakeClock) -> None:
     job, tasks = load_and_split("demo/gallery.yaml", clock)
     assert len(job.prompts) == 24
@@ -132,3 +142,44 @@ def test_split_gallery_yaml_24_tasks(clock: FakeClock) -> None:
     assert tasks[0].task_id.endswith("-00")
     assert tasks[0].max_attempts == 3
     assert tasks[0].state == "QUEUED"
+
+
+def test_split_gallery_count_truncates(clock: FakeClock) -> None:
+    job, tasks = load_and_split("demo/gallery.yaml", clock, count=6)
+    assert len(job.prompts) == 6
+    assert len(tasks) == 6
+    assert [t.shard_index for t in tasks] == list(range(6))
+
+
+def test_quota_pick_respects_reservation(clock: FakeClock, tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    sched = Scheduler(store, clock=clock)
+    store.put_node(_cuda_node("n1", 0.9))
+    store.put_node(_cuda_node("n2", 0.2))
+    job = Job(
+        job_id="j",
+        created_at=clock.now(),
+        scheduler_policy="quota",
+        quotas={"n1": 1, "n2": 1},
+        requirements=JobRequirements(),
+        prompts=[],
+    )
+    store.put_job(job)
+    for i, reserved in enumerate(("n1", "n2")):
+        store.put_task(
+            Task(
+                task_id=f"j-{i:02d}",
+                job_id="j",
+                shard_index=i,
+                prompt=str(i),
+                seed=i,
+                created_at=clock.now(),
+                reserved_node=reserved,
+            )
+        )
+    first = sched.on_work_request("n2")
+    assert first is not None and first.reserved_node == "n2"
+    second = sched.on_work_request("n2")
+    assert second is None
+    other = sched.on_work_request("n1")
+    assert other is not None and other.reserved_node == "n1"

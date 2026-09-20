@@ -98,11 +98,15 @@ class _FakePipe:
     def __init__(self) -> None:
         self.moved_to = None
         self.sliced = False
+        self.vae_sliced = False
+        self.vae_tiled = False
         self.xformers = False
         self.safety_checker = object()
         self.requires_safety_checker = True
+        self.feature_extractor = object()
         self.unet = _FakeModule()
         self.vae = _FakeModule()
+        self.calls: list[dict[str, object]] = []
 
     def to(self, device):
         self.moved_to = device
@@ -111,11 +115,22 @@ class _FakePipe:
     def enable_attention_slicing(self) -> None:
         self.sliced = True
 
+    def enable_vae_slicing(self) -> None:
+        self.vae_sliced = True
+
+    def enable_vae_tiling(self) -> None:
+        self.vae_tiled = True
+
     def enable_xformers_memory_efficient_attention(self) -> None:
         self.xformers = True
 
     def set_progress_bar_config(self, **kwargs) -> None:
         return None
+
+    def __call__(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        image = type("Img", (), {"save": lambda _self, buf, format="PNG": buf.write(b"\x89PNG")})()
+        return type("Out", (), {"images": [image]})()
 
 
 def test_kernel_load_dispatches_single_file(monkeypatch, tmp_path: Path) -> None:
@@ -169,6 +184,9 @@ def test_kernel_load_dispatches_single_file(monkeypatch, tmp_path: Path) -> None
     assert captured["single"]["local_files_only"] is True
     assert captured["single"]["safety_checker"] is None
     assert fake.sliced is True
+    assert fake.vae_sliced is True
+    assert fake.vae_tiled is True
+    assert fake.feature_extractor is None
     assert kernel._pretrained == str(weights)
 
 
@@ -288,6 +306,8 @@ def test_kernel_load_dispatches_snapshot_dir(monkeypatch, tmp_path: Path) -> Non
     assert captured["auto"]["local_files_only"] is True
     assert captured["auto"].get("variant") == "fp16"
     assert fake.sliced is False
+    assert fake.vae_sliced is True
+    assert fake.vae_tiled is False
     assert fake.safety_checker is None
     assert fake.xformers is True
     assert fake.unet.memory_format == "channels_last"
@@ -314,3 +334,139 @@ def test_adopt_local_single_file(tmp_path: Path, monkeypatch) -> None:
     assert adopted is not None
     assert adopted.is_file()
     assert adopted.resolve() == src.resolve()
+
+
+def _install_fake_torch(monkeypatch, *, kind: str = "mps"):
+    import sys
+    import types
+
+    fake_torch = types.ModuleType("torch")
+
+    class FakeDevice:
+        def __init__(self, name: str) -> None:
+            self.type = str(name).split(":")[0]
+            self.name = str(name)
+
+        def __repr__(self) -> str:
+            return self.name
+
+    class FakeGen:
+        def __init__(self, device=None) -> None:
+            self.device = device
+            self.seed = None
+
+        def manual_seed(self, seed: int):
+            self.seed = seed
+            return self
+
+    class _Infer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class _Cache:
+        def __init__(self) -> None:
+            self.empty_cache_calls = 0
+            self.synchronize_calls = 0
+
+        def empty_cache(self) -> None:
+            self.empty_cache_calls += 1
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
+    fake_torch.device = FakeDevice
+    fake_torch.float16 = "float16"
+    fake_torch.float32 = "float32"
+    fake_torch.Generator = FakeGen
+    fake_torch.inference_mode = lambda: _Infer()
+    fake_torch.cuda = _Cache()
+    fake_torch.mps = _Cache()
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    return fake_torch
+
+
+def test_execute_releases_mps_cache(monkeypatch, tmp_path: Path) -> None:
+    from nova.clock import now_utc
+    from nova.kernels.sd_t2i import SDText2ImageKernel
+    from nova.models import Device, Task
+
+    fake_torch = _install_fake_torch(monkeypatch, kind="mps")
+    fake = _FakePipe()
+    kernel = SDText2ImageKernel(Settings(model_dir=tmp_path, model_id="stabilityai/sd-turbo"))
+    kernel._pipe = fake
+    kernel._torch_device = fake_torch.device("mps")
+    kernel._pretrained = "stabilityai/sd-turbo"
+    device = Device(
+        device_id="mps:0", backend="metal", vendor="apple", model="M", memory_total_mb=16
+    )
+    result = kernel.execute_sync(
+        Task(
+            task_id="t",
+            job_id="j",
+            shard_index=0,
+            prompt="neon",
+            seed=7,
+            steps=4,
+            width=512,
+            height=512,
+            created_at=now_utc(),
+        ),
+        device,
+    )
+    assert result.backend == "metal"
+    assert result.png_bytes.startswith(b"\x89PNG")
+    assert fake.calls[0]["output_type"] == "pil"
+    assert fake.calls[0]["guidance_scale"] == 0.0
+    assert fake_torch.mps.empty_cache_calls == 1
+    assert fake_torch.cuda.empty_cache_calls == 0
+    assert kernel._pipe is fake
+
+
+def test_execute_oom_rewrapped_and_cache_released(monkeypatch, tmp_path: Path) -> None:
+    import pytest
+
+    from nova.clock import now_utc
+    from nova.kernels.sd_t2i import SDText2ImageKernel
+    from nova.models import Device, Task
+
+    fake_torch = _install_fake_torch(monkeypatch, kind="mps")
+
+    class BoomPipe(_FakePipe):
+        def __call__(self, **kwargs):
+            raise RuntimeError("MPS backend out of memory (MPS allocated 18 GB)")
+
+    kernel = SDText2ImageKernel(Settings(model_dir=tmp_path, model_id="stabilityai/sd-turbo"))
+    kernel._pipe = BoomPipe()
+    kernel._torch_device = fake_torch.device("mps")
+    kernel._pretrained = "stabilityai/sd-turbo"
+    device = Device(
+        device_id="mps:0", backend="metal", vendor="apple", model="M", memory_total_mb=16
+    )
+    with pytest.raises(RuntimeError, match="tile will requeue"):
+        kernel.execute_sync(
+            Task(
+                task_id="t",
+                job_id="j",
+                shard_index=0,
+                prompt="neon",
+                seed=7,
+                created_at=now_utc(),
+            ),
+            device,
+        )
+    assert fake_torch.mps.empty_cache_calls == 1
+    assert kernel._pipe is not None
+
+
+def test_is_oom_detects_cuda_and_mps() -> None:
+    from nova.kernels.sd_t2i import _is_oom
+
+    class OutOfMemoryError(RuntimeError):
+        pass
+
+    assert _is_oom(OutOfMemoryError("CUDA out of memory"))
+    assert _is_oom(RuntimeError("MPS backend out of memory"))
+    assert not _is_oom(RuntimeError("prompt too long"))

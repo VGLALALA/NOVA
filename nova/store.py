@@ -82,11 +82,18 @@ class Store:
     def get_node(self, node_id: str) -> NodeManifest | None:
         return self._nodes.get(node_id)
 
+    def delete_node(self, node_id: str) -> bool:
+        gone = self._nodes.pop(node_id, None) is not None
+        self._last_seen.pop(node_id, None)
+        return gone
+
     def list_nodes(self) -> list[NodeManifest]:
         return list(self._nodes.values())
 
-    def touch_node(self, node_id: str, when: datetime) -> None:
-        self._last_seen[node_id] = when
+    def touch_node(self, node_id: str, when: datetime | None = None) -> None:
+        from nova.clock import now_utc
+
+        self._last_seen[node_id] = when or now_utc()
 
     def get_last_seen(self, node_id: str) -> datetime | None:
         return self._last_seen.get(node_id)

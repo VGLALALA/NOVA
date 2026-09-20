@@ -1,6 +1,6 @@
 # NOVA Development Progress
 
-Last updated: 2026-09-19 (v0.2.0 services + dashboard dispatch)
+Last updated: 2026-09-19 (dashboard tabs + FP16 TFLOPS + quota mode)
 
 This is the living handoff ledger for NOVA. Read this file together with
 `NOVA_DEVELOPMENT_PLAN.md`, which remains the implementation contract. Update
@@ -25,8 +25,8 @@ unit tests.
 
 Recorded before the 2026-09-19 continuation work:
 
-- `python -m pytest -q -p no:cacheprovider`: **109 passed**, 3 third-party
-  deprecation warnings, in 2.07s (2026-09-19 after single-file / Metal work).
+- `python -m pytest -q -p no:cacheprovider`: **127 passed**, 3 third-party
+  deprecation warnings, in 2.52s (2026-09-19 after Pear startup wiring).
 - `python -m compileall -q nova tests`: passed.
 - `node --check pear/bridge.js`: passed.
 - `node --check dashboard/app.js`: passed.
@@ -98,8 +98,10 @@ full rehearsal unverified.**
   three-worker in-process simulation are present.
 - API result validation covers empty bodies, garbage PNGs, SHA-256, stale lease
   generations, and first-winner behavior.
-- A full browser rehearsal, projector readability check, contribution labels,
-  backup recording, and physical 24-tile run are not recorded here yet.
+- Dashboard **tiles** control (1–96, default 24) dispatches that many prompts
+  from `demo/gallery.yaml`. Custom prompt repeats N times with incrementing
+  seeds. Gallery/Benchmark tabs, FP16 TFLOPS from warmup, ASAP vs per-node
+  quota generation. Projector check still unverified.
 
 ## Highest-priority pending work
 
@@ -113,9 +115,11 @@ full rehearsal unverified.**
    (2026-09-19): `nova start --dummy --simulate-workers 3` then
    `nova run demo/gallery.yaml` completed 24/24 with CUDA 15 / ROCm 6 /
    Metal 3 contribution. Projector/browser check still unverified.
-5. Wire Pear/Hyperswarm into executable startup (or explicitly revise the
-   contract); `PearTransport` and `Hub` currently exist but `nova start` builds
-   only the direct TCP transport.
+5. ~~Wire Pear/Hyperswarm into executable startup~~ **done locally**
+   (2026-09-19): `nova start` / `nova worker` build a Pear+TCP `Hub` when
+   `pear/node_modules/hyperswarm` exists; typed `NOVA_PEERS` /
+   `NOVA_COORDINATOR_URL` still open TCP. Local in-process worker stays TCP
+   only. Physical hotspot discovery still unverified.
 6. ~~Make `NOVA_ROLE=worker` select worker startup as documented~~ **done
    locally** (2026-09-19); `--worker` still wins over env.
 7. ~~Fail closed for real GPU startup when torch/diffusers or a CUDA/ROCm/Metal
@@ -136,6 +140,11 @@ full rehearsal unverified.**
     `models/`, `.nova/`, `starter/.tools/`, and `.claude/worktrees/` ignored.
 14. Address the Ruff backlog after the contract-critical flow is green; do not
     mix broad style rewrites into failover or result-fencing work.
+15. ~~Split one 512×512 image across nodes at the same time~~ **won't build**
+    (2026-09-19). Gallery sharding (24 independent tiles) is the right split.
+    DistriFusion/AsyncDiff/PipeFusion need NVLink, 25–50 steps, and ≥1024px.
+    Our 4-step Metal 873 ms / CUDA 312 ms tiles lose to ngrok RTT. Naive
+    patches seam. See journal below.
 
 ## Handoff rules
 
@@ -364,3 +373,58 @@ relative to the initial commit.
 - Version bumped to 0.2.0 for the GitHub Release.
 - Remaining: physical service install on Windows CUDA still unverified;
   GitHub Release cut after this commit.
+
+### 2026-09-19 — bound per-tile GPU memory; keep Metal generating; shard on OOM
+
+- `nova/kernels/sd_t2i.py` now caps peak activation memory: VAE slicing on every
+  backend, attention slicing + VAE tiling on Metal, safety checker / feature
+  extractor dropped. Weights stay resident. After each tile, MPS `empty_cache`
+  runs so unified memory does not grow across the 24-tile job. CUDA keeps its
+  allocator cache so NVIDIA stays fast.
+- `output_type="pil"` and the pipeline output list are dropped before the next
+  tile. CUDA/MPS synchronize after generate.
+- OOM (`CUDA out of memory`, `MPS backend out of memory`) is re-raised as
+  `accelerator out of memory on this node; tile will requeue`. The worker already
+  emits `TASK_FAILED` (not `TASK_COMPLETE`); the scheduler poison-blacklists that
+  node for one pull cycle so CUDA/ROCm/Metal siblings take the shard. Mac still
+  generates; it does not have to finish the gallery alone.
+- Tests: Metal load enables slice+tile; CUDA load enables VAE slice only;
+  execute releases MPS cache and keeps the pipe; OOM is rewrapped; worker OOM
+  path sends `TASK_FAILED` and frees the slot.
+- Remaining: live Mac+CUDA 24-tile after worker restart not yet re-run.
+
+### 2026-09-19 — intra-image same-time split: researched, not built
+
+- Question: can Mac Metal + Linux CUDA denoise **one** 512×512 SD-Turbo image
+  at the same time (patches, steps, or UNet stages)?
+- Verdict: **no.** Keep 1 Task = 1 full image. Parallelism stays **inter-tile**
+  (24 prompts, one exclusive lease each). OOM on Mac already requeues that
+  whole tile to CUDA (`TASK_FAILED` + one-cycle poison blacklist).
+- Why not: DistriFusion (CVPR 2024, arXiv:2402.19481) wins at 1024–3840, 25–50
+  steps, NVLink A100s; naive patches seam (2-GPU PSNR 14.0 vs 24.6); authors
+  say NVLink is essential and extremely-few-step samplers may not work.
+  AsyncDiff (arXiv:2406.06911) is 50-step UNet stages on NVLink; lowest timed
+  is 25 steps; poor interconnect “may not perform optimally.” PipeFusion /
+  xDiT (arXiv:2405.14430) is DiT/Flux on homogeneous PCIe CUDA — Flux is
+  contract-forbidden. STADI (arXiv:2509.04719) exists because mixed-speed
+  GPUs idle the fast one under per-step barriers.
+- Arithmetic on this mesh: CUDA 4-step 512 = 312 ms, Metal = 873 ms. Two
+  ngrok barriers (~80 ms RTT) already add ~160 ms before activation bytes.
+  SD-Turbo `guidance_scale=0` so there is no CFG split. Step-split is serial.
+- No scheduler, protocol, kernel, or dashboard changes. Do not add a tensor
+  data plane or multi-assignee lease. Reconsider only for same-vendor NVLink
+  and multi-second high-res images; then use distrifuser/xDiT as a library,
+  do not fork `adaptive_pull`.
+- Verification: literature + existing demo timings; no new GPU run. Suite
+  last recorded **120 passed** after the memory-bound work.
+
+### 2026-09-19 — Pear/Hyperswarm wired into `nova start`
+
+- `_make_control` now builds TCP plus `PearTransport` when
+  `pear/node_modules/hyperswarm` exists, wrapped in `Hub`. Typed
+  `NOVA_PEERS` / `NOVA_COORDINATOR_URL` remain the emergency path.
+- Workers may join on Pear alone; they still need `NOVA_COORDINATOR_URL`
+  for PNG PUT if discovery does not carry the HTTP base.
+- Local in-process worker on `nova start` stays TCP-only so it does not
+  spawn a second sidecar. `Hub.bound_port` proxies the TCP listen port.
+- Tests: `tests/test_control_plane.py`. Physical hotspot still unverified.

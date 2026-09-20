@@ -113,6 +113,20 @@ def grant_lease(
     return task
 
 
+def _quota_remaining(store: Store, job: Job, node_id: str) -> int | None:
+    if (job.scheduler_policy or "adaptive_pull") != "quota":
+        return None
+    assigned = int((job.quotas or {}).get(node_id, 0))
+    used = 0
+    for task in store.list_tasks(job.job_id):
+        holder = task.assigned_node or task.reserved_node
+        if holder != node_id:
+            continue
+        if task.state in ("LEASED", "RUNNING", "COMPLETED"):
+            used += 1
+    return assigned - used
+
+
 def pick_task(store: Store, node: NodeManifest, clock: Clock | None = None) -> Task | None:  # noqa: ARG001
     """Oldest QUEUED compatible task. One-cycle poison blacklist on last_failed_node."""
     if node.status != "online":
@@ -125,6 +139,14 @@ def pick_task(store: Store, node: NodeManifest, clock: Clock | None = None) -> T
             continue
         if not is_compatible(node, task):
             continue
+        job = store.get_job(task.job_id)
+        if job is not None and (job.scheduler_policy or "adaptive_pull") == "quota":
+            remaining = _quota_remaining(store, job, node.node_id)
+            reserved = task.reserved_node
+            if reserved and reserved != node.node_id:
+                continue
+            if remaining is not None and remaining <= 0:
+                continue
         if task.last_failed_node == node.node_id:
             poison.append(task)
             continue
@@ -365,6 +387,15 @@ def check_node_liveness(
             continue
         seen = store.get_last_seen(node.node_id)
         if seen is None:
+            _mark_offline(
+                store,
+                node.node_id,
+                clock,
+                reason="never_seen",
+                event_type=NODE_OFFLINE,
+                event_bus=event_bus,
+            )
+            offlined.append(node.node_id)
             continue
         age = (now - seen).total_seconds()
         if age >= offline_s:
